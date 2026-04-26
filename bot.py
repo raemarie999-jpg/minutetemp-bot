@@ -65,11 +65,13 @@ def get_ticket():
 # WEBSOCKET EVENTS
 # -------------------------
 def on_message(ws, message):
+    print("📩 RAW MESSAGE RECEIVED:", message, flush=True)
+
     try:
         event = json.loads(message)
         engine.process_event(event)
     except Exception as e:
-        print("❌ Message error:", repr(e), flush=True)
+        print("❌ Parse error:", repr(e), flush=True)
 
 
 def on_open(ws):
