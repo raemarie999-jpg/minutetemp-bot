@@ -1,132 +1,78 @@
 import json
-import time
-import requests
 import websocket
-import traceback
-import sys
 
-from config import API_KEY, CITIES
-from model_engine import ModelEngine
+CITIES = ["nyc"]
 
-
-# -------------------------
-# FORCE REAL-TIME LOGGING
-# -------------------------
-sys.stdout.reconfigure(line_buffering=True)
-
-engine = ModelEngine()
-
-TICKET_URL = "https://api.minutetemp.com/api/v1/ws-ticket"
-WS_URL = "wss://api.minutetemp.com/ws/api/1m"
+print("🔥 BOT STARTING")
+print("🌍 CITIES:", CITIES)
 
 
-# -------------------------
-# STARTUP CHECK
-# -------------------------
-print("🔥 BOT STARTING", flush=True)
-print("🔑 API KEY LOADED:", bool(API_KEY), flush=True)
-print("🌍 CITIES:", CITIES, flush=True)
+def handle_message(msg):
+    msg_type = msg.get("type")
+
+    if msg_type == "subscribed":
+        print("✅ SUBSCRIBED")
+        print("Accepted:", msg.get("accepted"))
+
+    elif msg_type == "observation":
+        print("\n🌡 OBSERVATION")
+        print(f"{msg['slug']} | {msg['station_id']}")
+        print(f"Temp: {msg['temperature_f']}°F")
+
+    elif msg_type == "weather_event":
+        print("\n⚠️ WEATHER EVENT")
+        print(msg.get("summary", "No summary"))
+
+    elif msg_type == "forecast_versions":
+        print("\n📊 FORECAST UPDATE")
+        print(f"{msg['slug']} ({msg['station_id']})")
+        print(f"Models: {len(msg['versions'])}")
+
+    elif msg_type == "oracle_scores_updated":
+        print("\n📈 MODEL SCORES UPDATED")
+        print(msg.get("slug"))
+        print("Modes:", msg.get("modes"))
+
+    else:
+        print("\n📩 UNKNOWN MESSAGE")
+        print(msg)
 
 
-# -------------------------
-# GET WEBSOCKET TICKET
-# -------------------------
-def get_ticket():
-    print("📡 Requesting ticket...", flush=True)
-
-    try:
-        resp = requests.post(
-            TICKET_URL,
-            headers={
-                "X-API-Key": API_KEY,
-                "Accept": "application/json"
-            },
-            timeout=10
-        )
-
-        print("📨 Ticket status:", resp.status_code, flush=True)
-
-        data = resp.json()
-
-        if "data" not in data or "ticket" not in data["data"]:
-            raise ValueError(f"Bad ticket response: {data}")
-
-        ticket = data["data"]["ticket"]
-
-        print("🎟 Ticket received OK", flush=True)
-        return ticket
-
-    except Exception as e:
-        print("❌ Ticket request failed:", repr(e), flush=True)
-        raise
-
-
-# -------------------------
-# WEBSOCKET EVENTS
-# -------------------------
 def on_message(ws, message):
-    print("📩 RAW MESSAGE RECEIVED:", message, flush=True)
-
     try:
-        event = json.loads(message)
-        engine.process_event(event)
+        data = json.loads(message)
+        handle_message(data)
     except Exception as e:
-        print("❌ Parse error:", repr(e), flush=True)
+        print("❌ Error parsing message:", e)
+        print(message)
 
 
 def on_open(ws):
-    print("✅ WebSocket connected", flush=True)
-
-    for city in CITIES:
-        ws.send(json.dumps({
-            "type": "subscribe",
-            "cities": [city]
-        }))
-
-    print("📡 Subscribed to cities", flush=True)
+    print("🔌 WebSocket connected")
+    ws.send(json.dumps({
+        "type": "subscribe",
+        "cities": CITIES
+    }))
+    print("📡 Subscribed to cities")
 
 
 def on_error(ws, error):
-    print("⚠️ WebSocket error:", repr(error), flush=True)
+    print("❌ WebSocket error:", error)
 
 
-def on_close(ws, code, msg):
-    print(f"🔌 WebSocket closed: {code} {msg}", flush=True)
+def on_close(ws, close_status_code, close_msg):
+    print("🔌 WebSocket closed", close_status_code, close_msg)
 
 
-# -------------------------
-# MAIN LOOP
-# -------------------------
-def run():
-    print("🚀 ENTERING MAIN LOOP", flush=True)
-
-    while True:
-        try:
-            ticket = get_ticket()
-
-            print("🔌 Opening WebSocket...", flush=True)
-
-            ws = websocket.WebSocketApp(
-                WS_URL,
-                subprotocols=["bearer", ticket],
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            ws.run_forever(ping_interval=50)
-
-        except Exception:
-            print("❌ CRASH OCCURRED:", flush=True)
-            print(traceback.format_exc(), flush=True)
-
-        print("♻️ Restarting in 3 seconds...", flush=True)
-        time.sleep(3)
-
-
-# -------------------------
-# ENTRY POINT
-# -------------------------
 if __name__ == "__main__":
-    run()
+    print("🚀 ENTERING MAIN LOOP")
+
+    ws = websocket.WebSocketApp(
+        "wss://YOUR_WEBSOCKET_URL_HERE",
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+
+    ws.run_forever()
