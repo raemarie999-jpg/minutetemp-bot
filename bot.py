@@ -40,6 +40,7 @@ engine = ModelEngine()
 # MESSAGE HANDLER
 # -------------------------
 def handle_message(msg):
+    print("📥 HANDLE:", msg.get("type"), flush=True)
     msg_type = msg.get("type")
 
     if msg_type == "subscribed":
