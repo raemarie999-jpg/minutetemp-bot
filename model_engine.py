@@ -1,3 +1,6 @@
+import csv
+import time
+import os
 from collections import defaultdict
 import numpy as np
 
@@ -5,6 +8,24 @@ import numpy as np
 class ModelEngine:
     def __init__(self):
         self.errors = defaultdict(list)
+
+    def log_row(self, city, model, predicted, actual, error):
+        file_exists = os.path.isfile("model_log.csv")
+
+        with open("model_log.csv", "a", newline="") as f:
+            writer = csv.writer(f)
+
+            if not file_exists:
+                writer.writerow(["timestamp", "city", "model", "predicted", "actual", "error"])
+
+            writer.writerow([
+                time.time(),
+                city,
+                model,
+                predicted,
+                actual,
+                error
+            ])
 
     def process_event(self, event):
         if event.get("type") == "forecast":
