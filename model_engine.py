@@ -4,22 +4,26 @@ import os
 from collections import defaultdict, deque
 import numpy as np
 
+from telegram_alerts import TelegramAlerts
+
 
 class ModelEngine:
     def __init__(self):
         # -------------------------
-        # HISTORICAL MEMORY
+        # HISTORICAL DATA
         # -------------------------
         self.all_errors = defaultdict(list)
 
         # -------------------------
-        # ACTIVE ROLLING WINDOWS
+        # ROLLING WINDOW (LIVE)
         # -------------------------
         self.window_size = 30
-        self.rolling_errors = defaultdict(lambda: defaultdict(lambda: deque(maxlen=self.window_size)))
+        self.rolling_errors = defaultdict(
+            lambda: defaultdict(lambda: deque(maxlen=self.window_size))
+        )
 
         # -------------------------
-        # FORECAST STORAGE (with TTL)
+        # FORECAST STORAGE (TTL)
         # -------------------------
         self.forecasts = {}
         self.forecast_ttl = 60 * 30  # 30 minutes
@@ -29,10 +33,15 @@ class ModelEngine:
         # -------------------------
         self.last_best_by_city = {}
         self.last_alert_time = defaultdict(float)
-        self.alert_cooldown = 60  # seconds
+        self.alert_cooldown = 60
+
+        # -------------------------
+        # TELEGRAM
+        # -------------------------
+        self.telegram = TelegramAlerts()
 
     # =========================================================
-    # CSV LOGGING (HISTORICAL — NEVER FILTERED)
+    # LOGGING
     # =========================================================
     def log_row(self, city, model, predicted, actual, error):
         file_exists = os.path.isfile("model_log.csv")
@@ -53,7 +62,7 @@ class ModelEngine:
             ])
 
     # =========================================================
-    # EVENT INGESTION
+    # INGESTION
     # =========================================================
     def process_event(self, event):
         if event.get("type") == "forecast":
@@ -70,7 +79,7 @@ class ModelEngine:
             self.compare(event)
 
     # =========================================================
-    # CORE COMPARISON ENGINE
+    # CORE COMPARISON
     # =========================================================
     def compare(self, obs):
         city = obs.get("city")
@@ -85,9 +94,6 @@ class ModelEngine:
             if c != city:
                 continue
 
-            # -------------------------
-            # TTL FILTER (ACTIVE WINDOW)
-            # -------------------------
             if now - data["timestamp"] > self.forecast_ttl:
                 continue
 
@@ -99,42 +105,22 @@ class ModelEngine:
 
             error = abs(predicted - actual)
 
-            # -------------------------
-            # STORE HISTORICAL + ROLLING
-            # -------------------------
+            # store
             self.all_errors[model].append(error)
             self.rolling_errors[city][model].append(error)
 
             self.log_row(city, model, predicted, actual, error)
 
-        # -------------------------
-        # RUN ALERTS
-        # -------------------------
         self.detect_alerts(city)
 
     # =========================================================
-    # GLOBAL BEST MODEL (HISTORICAL)
-    # =========================================================
-    def best_model(self):
-        scores = {
-            m: np.mean(v)
-            for m, v in self.all_errors.items()
-            if len(v) > 0
-        }
-
-        if not scores:
-            return None
-
-        return min(scores, key=scores.get)
-
-    # =========================================================
-    # CITY BEST MODEL (ROLLING = LIVE INTELLIGENCE)
+    # LIVE BEST MODEL
     # =========================================================
     def best_model_city(self, city):
         scores = {
             m: np.mean(v)
             for m, v in self.rolling_errors[city].items()
-            if len(v) >= 5  # stability requirement
+            if len(v) >= 5
         }
 
         if len(scores) < 2:
@@ -142,19 +128,18 @@ class ModelEngine:
 
         sorted_models = sorted(scores.items(), key=lambda x: x[1])
 
-        best_model, best_score = sorted_models[0]
-        second_score = sorted_models[1][1]
+        best = sorted_models[0][0]
+        second = sorted_models[1][1]
 
-        confidence_gap = second_score - best_score
+        gap = second - sorted_models[0][1]
 
-        return best_model, confidence_gap
+        return best, gap
 
     # =========================================================
-    # TRUE PREDICTIVE BEST MODEL
-    # (trend-weighted, not just raw mean)
+    # PREDICTIVE BEST MODEL
     # =========================================================
     def predictive_best_model(self, city):
-        weighted_scores = {}
+        scores = {}
 
         for model, errors in self.rolling_errors[city].items():
             if len(errors) < 10:
@@ -162,56 +147,49 @@ class ModelEngine:
 
             arr = np.array(errors)
 
-            # recent performance weighted more heavily
             weights = np.linspace(0.5, 1.5, len(arr))
-            weighted_avg = np.average(arr, weights=weights)
+            weighted = np.average(arr, weights=weights)
 
-            # stability penalty (variance)
             stability = np.std(arr)
 
-            score = weighted_avg + (0.5 * stability)
+            scores[model] = weighted + (0.5 * stability)
 
-            weighted_scores[model] = score
-
-        if not weighted_scores:
+        if not scores:
             return None
 
-        return min(weighted_scores, key=weighted_scores.get)
+        return min(scores, key=scores.get)
 
     # =========================================================
-    # ALERT SYSTEM
+    # ALERT ENGINE
     # =========================================================
     def detect_alerts(self, city):
-        best_live, confidence_gap = self.best_model_city(city)
-        best_predicted = self.predictive_best_model(city)
-
         now = time.time()
 
-        # cooldown protection
         if now - self.last_alert_time[city] < self.alert_cooldown:
             return
 
-        # -------------------------
-        # MODEL FLIP ALERT
-        # -------------------------
+        live_best, gap = self.best_model_city(city)
+        pred_best = self.predictive_best_model(city)
+
         prev = self.last_best_by_city.get(city)
 
-        if prev and best_live and prev != best_live:
-            print(f"🔁 MODEL FLIP [{city}] {prev} → {best_live}")
+        # ---------------- FLIP ----------------
+        if prev and live_best and prev != live_best:
+            self.telegram.send(
+                f"🔁 Model Flip ({city})\n{prev} → {live_best}\nGap: {gap:.2f}"
+            )
             self.last_alert_time[city] = now
 
-        self.last_best_by_city[city] = best_live
+        self.last_best_by_city[city] = live_best
 
-        # -------------------------
-        # CONFIDENCE ALERT
-        # -------------------------
-        if confidence_gap is not None and confidence_gap < 0.5:
-            print(f"⚠️ LOW CONFIDENCE [{city}] gap={confidence_gap:.3f}")
+        # ---------------- CONFIDENCE ----------------
+        if gap is not None and gap < 0.5:
+            self.telegram.send(
+                f"⚠️ Low Confidence ({city})\nGap: {gap:.2f}"
+            )
             self.last_alert_time[city] = now
 
-        # -------------------------
-        # ERROR SPIKE ALERT
-        # -------------------------
+        # ---------------- SPIKE ----------------
         for model, errors in self.rolling_errors[city].items():
             if len(errors) < 10:
                 continue
@@ -220,5 +198,14 @@ class ModelEngine:
             baseline = np.mean(list(errors)[:-1])
 
             if baseline > 0 and current > baseline * 1.5:
-                print(f"🚨 ERROR SPIKE [{city}] {model}")
+                self.telegram.send(
+                    f"🚨 Error Spike ({city})\n{model}"
+                )
                 self.last_alert_time[city] = now
+
+        # ---------------- PREDICTIVE SHIFT ----------------
+        if pred_best and live_best and pred_best != live_best:
+            self.telegram.send(
+                f"🔮 Forecast Shift ({city})\nLive: {live_best}\nPredicted: {pred_best}"
+            )
+            self.last_alert_time[city] = now
