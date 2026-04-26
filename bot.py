@@ -1,8 +1,6 @@
 import json
 import os
-import time
 import sys
-
 import requests
 import websocket
 
@@ -25,12 +23,9 @@ WS_URL = os.getenv(
 
 CITIES = [
     c.strip()
-    for c in os.getenv("CITIES", "chi,nyc,dal").split(",")
+    for c in os.getenv("CITIES", "nyc").split(",")
     if c.strip()
 ]
-
-RECONNECT_DELAY = 5
-MAX_RECONNECT_DELAY = 60
 
 print("🔥 BOT STARTING", flush=True)
 print("🌍 CITIES:", CITIES, flush=True)
@@ -42,17 +37,85 @@ if not API_KEY:
 engine = ModelEngine()
 
 # -------------------------
-# CACHE TICKET (IMPORTANT FIX)
+# MESSAGE HANDLER
 # -------------------------
-_cached_ticket = None
+def handle_message(msg):
+    msg_type = msg.get("type")
+
+    if msg_type == "subscribed":
+        print("✅ SUBSCRIBED", msg.get("accepted"), flush=True)
+
+    elif msg_type == "observation":
+        print(
+            f"\n🌡 OBSERVATION {msg.get('slug')} | "
+            f"{msg.get('station_id')} | "
+            f"{msg.get('temperature_f')}°F",
+            flush=True,
+        )
+        engine.process_event({
+            "type": "observation",
+            "city": msg.get("slug"),
+            "station_id": msg.get("station_id"),
+            "value": msg.get("temperature_f"),
+        })
+
+    elif msg_type == "forecast_versions":
+        print("\n📊 FORECAST UPDATE", msg.get("slug"), flush=True)
+
+    elif msg_type == "oracle_scores_updated":
+        print("\n📈 MODEL SCORES UPDATED", msg.get("slug"), flush=True)
+
+        engine.process_event({
+            "type": "oracle_scores",
+            "city": msg.get("slug"),
+            "station_id": msg.get("station_id"),
+            "mode": "overall",
+            "scores": msg.get("overall", {}).get("scores", []),
+        })
+
+    elif msg_type == "weather_event":
+        print("\n⚠️ WEATHER EVENT", msg.get("summary"), flush=True)
+
+    else:
+        print("\n📩 MSG:", msg_type, flush=True)
+
+    engine.maybe_send_daily_summary()
 
 
-def get_ticket(force_refresh=False):
-    global _cached_ticket
+# -------------------------
+# WEBSOCKET CALLBACKS
+# -------------------------
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        handle_message(data)
+    except Exception as e:
+        print("❌ Parse error:", repr(e), flush=True)
 
-    if _cached_ticket and not force_refresh:
-        return _cached_ticket
 
+def on_open(ws):
+    print("🔌 WebSocket connected", flush=True)
+
+    for city in CITIES:
+        ws.send(json.dumps({
+            "type": "subscribe",
+            "cities": [city]
+        }))
+        print(f"📡 Subscribed: {city}", flush=True)
+
+
+def on_error(ws, error):
+    print("❌ WebSocket error:", error, flush=True)
+
+
+def on_close(ws, close_status_code, close_msg):
+    print("🔌 WebSocket closed", close_status_code, close_msg, flush=True)
+
+
+# -------------------------
+# GET TICKET (ONCE ONLY)
+# -------------------------
+def get_ticket():
     print("📡 Requesting ticket...", flush=True)
 
     try:
@@ -74,75 +137,24 @@ def get_ticket(force_refresh=False):
 
     data = res.json()
 
-    ticket = None
-    if isinstance(data, dict):
-        if "data" in data and isinstance(data["data"], dict):
-            ticket = data["data"].get("ticket")
-        else:
-            ticket = data.get("ticket")
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        return inner.get("ticket")
 
-    if not ticket:
-        print("❌ No ticket in response", flush=True)
-        return None
-
-    _cached_ticket = ticket
-    return ticket
+    return data.get("ticket")
 
 
 # -------------------------
-# WEBSOCKET HANDLERS
+# SINGLE CONNECTION (MODEL A)
 # -------------------------
-def handle_message(msg):
-    msg_type = msg.get("type")
-
-    if msg_type == "observation":
-        print("\n🌡 OBSERVATION", msg.get("slug"), msg.get("temperature_f"), flush=True)
-
-    elif msg_type == "subscribed":
-        print("✅ SUBSCRIBED", msg.get("accepted"), flush=True)
-
-    elif msg_type == "weather_event":
-        print("\n⚠️ EVENT", msg.get("summary"), flush=True)
-
-    else:
-        print("\n📩 MSG:", msg_type, flush=True)
-
-
-def on_message(ws, message):
-    try:
-        handle_message(json.loads(message))
-    except Exception as e:
-        print("❌ Parse error:", repr(e), flush=True)
-
-
-def on_open(ws):
-    print("🔌 WebSocket connected", flush=True)
-
-    for city in CITIES:
-        ws.send(json.dumps({
-            "type": "subscribe",
-            "cities": [city]
-        }))
-        print(f"📡 Subscribed: {city}", flush=True)
-
-
-def on_error(ws, error):
-    print("❌ WebSocket error:", error, flush=True)
-
-
-def on_close(ws, code, msg):
-    print("🔌 WebSocket closed", code, msg, flush=True)
-
-
-# -------------------------
-# MAIN LOOP
-# -------------------------
-def run_ws():
+def connect():
     ticket = get_ticket()
-    if not ticket:
-        return False
 
-    print("🔌 Connecting WS...", flush=True)
+    if not ticket:
+        print("❌ No ticket — exiting", flush=True)
+        return
+
+    print("🔌 Opening WebSocket...", flush=True)
 
     ws = websocket.WebSocketApp(
         WS_URL,
@@ -153,31 +165,15 @@ def run_ws():
         on_close=on_close,
     )
 
-    ws.run_forever(ping_interval=30, ping_timeout=10)
-    return True
+    ws.run_forever(
+        ping_interval=30,
+        ping_timeout=10,
+    )
 
 
-def main():
-    print("🚀 ENTERING MAIN LOOP", flush=True)
-
-    delay = RECONNECT_DELAY
-
-    while True:
-        try:
-            ok = run_ws()
-        except Exception as e:
-            print("❌ Crash:", repr(e), flush=True)
-            ok = False
-
-        # IMPORTANT: do NOT always refresh ticket
-        if ok:
-            delay = RECONNECT_DELAY
-        else:
-            delay = min(delay * 2, MAX_RECONNECT_DELAY)
-
-        print(f"⏳ Restarting in {delay}s...", flush=True)
-        time.sleep(delay)
-
-
+# -------------------------
+# MAIN
+# -------------------------
 if __name__ == "__main__":
-    main()
+    print("🚀 ENTERING MAIN LOOP", flush=True)
+    connect()
