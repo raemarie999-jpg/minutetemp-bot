@@ -1,10 +1,46 @@
 import csv
-import time
 import os
+import time
 from collections import defaultdict, deque
+from datetime import datetime, timezone
+
 import numpy as np
 
 from telegram_alerts import TelegramAlerts
+
+
+LOG_DIR = os.getenv(
+    "WORKER_LOG_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
+)
+
+
+class CsvLogger:
+    """Append-only CSV writer. Self-heals the header if the file is missing
+    or empty (e.g. after manual log rotation)."""
+
+    def __init__(self, path: str, header: list):
+        self.path = path
+        self.header = header
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._ensure_header()
+
+    def _ensure_header(self):
+        if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
+            with open(self.path, "w", newline="") as f:
+                csv.writer(f).writerow(self.header)
+
+    def write(self, row: list):
+        try:
+            self._ensure_header()
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+        except Exception as e:
+            print(f"⚠️ CSV write error ({self.path}):", repr(e), flush=True)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class ModelEngine:
@@ -24,7 +60,7 @@ class ModelEngine:
         self.alert_cooldowns = {
             "HIGH": 120,
             "MEDIUM": 90,
-            "LOW": 300
+            "LOW": 300,
         }
 
         self.last_daily_summary = 0
@@ -39,55 +75,85 @@ class ModelEngine:
             "low_conf": 0,
         }
 
+        self.obs_log = CsvLogger(
+            os.path.join(LOG_DIR, "observations.csv"),
+            ["ts", "city", "station_id", "value"],
+        )
+        self.scores_log = CsvLogger(
+            os.path.join(LOG_DIR, "scores.csv"),
+            [
+                "ts", "city", "station_id", "mode", "model_id", "model_name",
+                "combined_mae", "high_mae", "low_mae",
+                "high_bias", "low_bias", "day_count",
+            ],
+        )
+        self.decision_log = CsvLogger(
+            os.path.join(LOG_DIR, "decisions.csv"),
+            ["ts", "city", "live_best", "predictive_best", "gap"],
+        )
+        self.alert_log = CsvLogger(
+            os.path.join(LOG_DIR, "alerts.csv"),
+            ["ts", "city", "level", "message", "sent"],
+        )
+
     # -------------------------
     # EVENT INGESTION
     # -------------------------
     def process_event(self, event):
-        if event.get("type") == "forecast":
-            self.metrics["forecasts"] += 1
+        etype = event.get("type")
 
-            city = event.get("city")
-            model = event.get("model")
-
-            if city and model:
-                self.forecasts[(city, model)] = {
-                    "event": event,
-                    "ts": time.time()
-                }
-
-        elif event.get("type") == "observation":
+        if etype == "observation":
             self.metrics["observations"] += 1
-            self.compare(event)
+            city = event.get("city")
+            value = event.get("value")
+            station = event.get("station_id")
+            if city is not None and value is not None:
+                self.obs_log.write([_now_iso(), city, station, value])
+
+        elif etype == "oracle_scores":
+            self.process_oracle_scores(event)
 
     # -------------------------
-    # CORE LOGIC
+    # ORACLE SCORE INGESTION
+    # MinuteTemp pre-computes 7-day rolling MAE per model and broadcasts it
+    # via `oracle_scores_updated`. We treat each broadcast as a fresh data
+    # point in our rolling history, then derive live + predictive winners.
     # -------------------------
-    def compare(self, obs):
-        city = obs.get("city")
-        actual = obs.get("value")
-
+    def process_oracle_scores(self, event):
+        city = event.get("city")
         if not city:
             return
 
-        now = time.time()
+        station = event.get("station_id")
+        mode = event.get("mode", "overall")
+        scores = event.get("scores") or []
 
-        for (c, model), data in self.forecasts.items():
-            if c != city:
+        ts = _now_iso()
+        any_score = False
+
+        for s in scores:
+            model_id = s.get("model_id")
+            mae = s.get("combined_mae")
+            if model_id is None or mae is None:
                 continue
 
-            if now - data["ts"] > self.forecast_ttl:
+            try:
+                mae = float(mae)
+            except (TypeError, ValueError):
                 continue
 
-            predicted = data["event"].get("value")
-            if predicted is None:
-                continue
-
-            error = abs(predicted - actual)
-
-            self.rolling_errors[city][model].append(error)
+            self.rolling_errors[city][model_id].append(mae)
             self.metrics["errors"] += 1
+            any_score = True
 
-        self.detect_alerts(city)
+            self.scores_log.write([
+                ts, city, station, mode, model_id, s.get("model_name"),
+                mae, s.get("high_mae"), s.get("low_mae"),
+                s.get("high_bias"), s.get("low_bias"), s.get("day_count"),
+            ])
+
+        if any_score:
+            self.detect_alerts(city)
 
     # -------------------------
     # BEST MODEL
@@ -103,10 +169,7 @@ class ModelEngine:
             return None, None
 
         sorted_models = sorted(scores.items(), key=lambda x: x[1])
-
-        return sorted_models[0][0], (
-            sorted_models[1][1] - sorted_models[0][1]
-        )
+        return sorted_models[0][0], (sorted_models[1][1] - sorted_models[0][1])
 
     # -------------------------
     # PREDICTIVE MODEL
@@ -119,7 +182,6 @@ class ModelEngine:
                 continue
 
             arr = np.array(errors)
-
             weighted = np.average(arr, weights=np.linspace(0.5, 1.5, len(arr)))
             slope = np.polyfit(np.arange(len(arr)), arr, 1)[0]
             vol = np.std(arr)
@@ -136,10 +198,12 @@ class ModelEngine:
         key = (city, level)
 
         if now - self.last_alert_time.get(key, 0) < self.alert_cooldowns[level]:
+            self.alert_log.write([_now_iso(), city, level, msg, False])
             return
 
         self.last_alert_time[key] = now
         self.telegram.send(msg)
+        self.alert_log.write([_now_iso(), city, level, msg, True])
 
     # -------------------------
     # ALERT LOGIC
@@ -161,6 +225,9 @@ class ModelEngine:
         if pred_best and live_best and pred_best != live_best:
             self.send_alert(city, "HIGH", f"🔮 Shift {city}: {pred_best} → {live_best}")
 
+        if live_best or pred_best:
+            self.decision_log.write([_now_iso(), city, live_best, pred_best, gap])
+
         self.last_best_by_city[city] = live_best
 
     # -------------------------
@@ -168,8 +235,12 @@ class ModelEngine:
     # -------------------------
     def daily_summary(self):
         lines = ["📊 DAILY SUMMARY"]
-
         for k, v in self.metrics.items():
             lines.append(f"{k}: {v}")
-
         return "\n".join(lines)
+
+    def maybe_send_daily_summary(self):
+        now = time.time()
+        if now - self.last_daily_summary >= self.daily_summary_interval:
+            self.last_daily_summary = now
+            self.telegram.send(self.daily_summary())
