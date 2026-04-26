@@ -22,7 +22,11 @@ WS_URL = os.getenv(
     "wss://api.minutetemp.com/ws/api/1m",
 )
 
-CITIES = [c.strip() for c in os.getenv("CITIES", "nyc").split(",") if c.strip()]
+CITIES = [
+    c.strip()
+    for c in os.getenv("CITIES", "nyc,chi,dal").split(",")
+    if c.strip()
+]
 
 RECONNECT_DELAY = 5
 MAX_RECONNECT_DELAY = 60
