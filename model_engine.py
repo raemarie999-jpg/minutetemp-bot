@@ -9,39 +9,58 @@ from telegram_alerts import TelegramAlerts
 
 class ModelEngine:
     def __init__(self):
-        # ----------------------------
-        # HISTORICAL STORAGE
-        # ----------------------------
+        # =========================
+        # HISTORICAL MEMORY
+        # =========================
         self.all_errors = defaultdict(list)
 
-        # ----------------------------
+        # =========================
         # ROLLING WINDOWS
-        # ----------------------------
+        # =========================
         self.window_size = 30
         self.rolling_errors = defaultdict(
             lambda: defaultdict(lambda: deque(maxlen=self.window_size))
         )
 
-        # ----------------------------
-        # FORECAST STORAGE (TTL)
-        # ----------------------------
+        # =========================
+        # FORECAST MEMORY (TTL)
+        # =========================
         self.forecasts = {}
-        self.forecast_ttl = 60 * 30  # 30 min
+        self.forecast_ttl = 60 * 30
 
-        # ----------------------------
+        # =========================
         # ALERT STATE
-        # ----------------------------
+        # =========================
         self.last_best_by_city = {}
         self.last_alert_time = {}
+
         self.alert_cooldowns = {
             "HIGH": 120,
             "MEDIUM": 90,
             "LOW": 300
         }
 
-        # ----------------------------
+        # =========================
+        # DAILY REPORT STATE
+        # =========================
+        self.last_daily_summary = 0
+        self.daily_summary_interval = 60 * 60 * 24
+
+        # =========================
+        # METRICS
+        # =========================
+        self.metrics = {
+            "total_forecasts": 0,
+            "total_observations": 0,
+            "total_errors_logged": 0,
+            "model_flips": 0,
+            "spikes": 0,
+            "low_confidence": 0,
+        }
+
+        # =========================
         # TELEGRAM
-        # ----------------------------
+        # =========================
         self.telegram = TelegramAlerts()
 
     # =========================================================
@@ -66,10 +85,12 @@ class ModelEngine:
             ])
 
     # =========================================================
-    # INGESTION
+    # EVENT INGESTION
     # =========================================================
     def process_event(self, event):
         if event.get("type") == "forecast":
+            self.metrics["total_forecasts"] += 1
+
             city = event.get("city")
             model = event.get("model")
 
@@ -80,6 +101,7 @@ class ModelEngine:
                 }
 
         elif event.get("type") == "observation":
+            self.metrics["total_observations"] += 1
             self.compare(event)
 
     # =========================================================
@@ -112,6 +134,8 @@ class ModelEngine:
             self.all_errors[model].append(error)
             self.rolling_errors[city][model].append(error)
 
+            self.metrics["total_errors_logged"] += 1
+
             self.log_row(city, model, predicted, actual, error)
 
         self.detect_alerts(city)
@@ -137,7 +161,7 @@ class ModelEngine:
         return best, gap
 
     # =========================================================
-    # PREDICTIVE MODEL (UPGRADED)
+    # PREDICTIVE MODEL (FINAL)
     # =========================================================
     def predictive_best_model(self, city):
         scores = {}
@@ -179,6 +203,13 @@ class ModelEngine:
         self.last_alert_time[key] = now
         self.telegram.send(message)
 
+        if "Flip" in message:
+            self.metrics["model_flips"] += 1
+        elif "Spike" in message:
+            self.metrics["spikes"] += 1
+        elif "Confidence" in message:
+            self.metrics["low_confidence"] += 1
+
     # =========================================================
     # ALERT LOGIC
     # =========================================================
@@ -188,7 +219,7 @@ class ModelEngine:
 
         prev = self.last_best_by_city.get(city)
 
-        # ---------------- FLIP ----------------
+        # MODEL FLIP
         if prev and live_best and prev != live_best:
             self.send_alert(
                 city,
@@ -198,7 +229,7 @@ class ModelEngine:
 
         self.last_best_by_city[city] = live_best
 
-        # ---------------- CONFIDENCE ----------------
+        # LOW CONFIDENCE
         if gap is not None and gap < 0.5:
             self.send_alert(
                 city,
@@ -206,7 +237,7 @@ class ModelEngine:
                 f"⚠️ Low Confidence ({city})\nGap: {gap:.2f}"
             )
 
-        # ---------------- SPIKE ----------------
+        # SPIKE
         for model, errors in self.rolling_errors[city].items():
             if len(errors) < 10:
                 continue
@@ -221,10 +252,41 @@ class ModelEngine:
                     f"🚨 Error Spike ({city})\n{model}"
                 )
 
-        # ---------------- PREDICTIVE SHIFT ----------------
+        # PREDICTIVE SHIFT
         if pred_best and live_best and pred_best != live_best:
             self.send_alert(
                 city,
                 "HIGH",
                 f"🔮 Forecast Shift ({city})\nLive: {live_best}\nPredicted: {pred_best}"
             )
+
+        # DAILY SUMMARY
+        self.run_daily_summary()
+
+    # =========================================================
+    # DAILY SUMMARY
+    # =========================================================
+    def generate_daily_summary(self):
+        lines = ["📊 DAILY MODEL SUMMARY\n"]
+
+        for city in self.rolling_errors:
+            live_best, _ = self.best_model_city(city)
+            pred_best = self.predictive_best_model(city)
+
+            lines.append(f"📍 {city.upper()}")
+            lines.append(f"Live: {live_best}")
+            lines.append(f"Predicted: {pred_best}\n")
+
+        lines.append("📈 METRICS")
+        for k, v in self.metrics.items():
+            lines.append(f"{k}: {v}")
+
+        return "\n".join(lines)
+
+    def run_daily_summary(self):
+        now = time.time()
+
+        if now - self.last_daily_summary > self.daily_summary_interval:
+            msg = self.generate_daily_summary()
+            self.telegram.send(msg)
+            self.last_daily_summary = now
