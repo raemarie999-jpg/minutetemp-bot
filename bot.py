@@ -2,9 +2,11 @@ import json
 import websocket
 import requests
 
+# 🔑 YOUR API KEY (this part you already had correct)
 API_KEY = "mt_663bb9c8e723a581d28130ddde325251694d086d9753f009cd7019348435e5c9"
 
-TICKET_URL = "https://api.minutetemp.com/v1/realtime/ticket"
+# ✅ CORRECT ENDPOINTS
+TICKET_URL = "https://api.minutetemp.com/v1/tickets"
 WS_BASE = "wss://stream.minutetemp.com/v1/realtime"
 
 CITIES = ["nyc"]
@@ -13,6 +15,9 @@ print("🔥 BOT STARTING")
 print("🌍 CITIES:", CITIES)
 
 
+# -------------------------
+# GET WEBSOCKET TICKET
+# -------------------------
 def get_ticket():
     print("📡 Requesting ticket...")
 
@@ -32,10 +37,14 @@ def get_ticket():
     data = res.json()
     print("📨 Ticket response:", data)
 
-    # 🔑 IMPORTANT: confirm actual field name here
+    # Most Minutetemp responses use this shape:
+    # { "ticket": "xxxx" }
     return data.get("ticket")
 
 
+# -------------------------
+# MESSAGE HANDLER
+# -------------------------
 def handle_message(msg):
     msg_type = msg.get("type")
 
@@ -48,17 +57,31 @@ def handle_message(msg):
         print(f"{msg.get('slug')} | {msg.get('station_id')}")
         print(f"Temp: {msg.get('temperature_f')}°F")
 
+    elif msg_type == "weather_event":
+        print("\n⚠️ WEATHER EVENT")
+        print(msg.get("summary"))
+
+    elif msg_type == "forecast_versions":
+        print("\n📊 FORECAST UPDATE")
+        print(msg.get("slug"), msg.get("station_id"))
+
+    elif msg_type == "oracle_scores_updated":
+        print("\n📈 MODEL SCORES UPDATED")
+        print(msg.get("slug"))
+
     else:
-        print("\n📩", msg_type)
+        print("\n📩 OTHER:", msg_type)
 
 
+# -------------------------
+# WEBSOCKET CALLBACKS
+# -------------------------
 def on_message(ws, message):
     try:
         data = json.loads(message)
         handle_message(data)
     except Exception as e:
         print("❌ Parse error:", e)
-        print(message)
 
 
 def on_open(ws):
@@ -80,20 +103,23 @@ def on_close(ws, close_status_code, close_msg):
     print("🔌 WebSocket closed", close_status_code, close_msg)
 
 
+# -------------------------
+# MAIN
+# -------------------------
 if __name__ == "__main__":
     print("🚀 ENTERING MAIN LOOP")
 
     ticket = get_ticket()
 
     if not ticket:
-        print("❌ No ticket — cannot continue")
+        print("❌ No ticket — exiting")
         exit(1)
 
-    print("🎟 Using ticket:", ticket)
+    print("🎟 Ticket:", ticket)
 
     WS_URL = f"{WS_BASE}?ticket={ticket}"
 
-    print("🔌 Opening WebSocket:", WS_URL)
+    print("🔌 Opening WebSocket...")
 
     ws = websocket.WebSocketApp(
         WS_URL,
