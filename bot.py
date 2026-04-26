@@ -2,8 +2,11 @@ import json
 import time
 import requests
 import websocket
-from config import API_KEY, CITIES
 
+from config import API_KEY, CITIES
+from model_engine import ModelEngine
+
+engine = ModelEngine()
 
 TICKET_URL = "https://api.minutetemp.com/api/v1/ws-ticket"
 WS_URL = "wss://api.minutetemp.com/ws/api/1m"
@@ -24,7 +27,13 @@ def get_ticket():
 
 # 2. WHEN DATA COMES IN
 def on_message(ws, message):
-    print("LIVE DATA:", message)
+    event = json.loads(message)
+
+    engine.process_event(event)
+
+    best = engine.best_model()
+    if best:
+        print("🔥 BEST MODEL RIGHT NOW:", best)
 
 
 # 3. WHEN CONNECTED
