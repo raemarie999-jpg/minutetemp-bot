@@ -1,3 +1,5 @@
-API_KEY = "mt_663bb9c8e723a581d28130ddde325251694d086d9753f009cd7019348435e5c9"
+import os
 
-CITIES = ["dfw", "chi"]
+API_KEY = os.getenv("MINUTETEMP_API_KEY")
+
+CITIES = ["KMDW", "KDFW"]
