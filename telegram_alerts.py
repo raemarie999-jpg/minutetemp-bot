@@ -21,7 +21,7 @@ class TelegramAlerts:
             requests.post(
                 f"{self.base_url}/sendMessage",
                 json={"chat_id": self.chat_id, "text": message},
-                timeout=5
+                timeout=5,
             )
         except Exception as e:
             print("Telegram error:", repr(e))
