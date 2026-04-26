@@ -24,7 +24,7 @@ WS_URL = os.getenv(
 
 CITIES = [
     c.strip()
-    for c in os.getenv("CITIES", "nyc,chi,dal").split(",")
+    for c in os.getenv("CITIES", "nyc", "chi", "dal").split(",")
     if c.strip()
 ]
 
