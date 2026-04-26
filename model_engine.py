@@ -105,6 +105,24 @@ class ModelEngine:
 
         return result
 
+    def model_wins(self):
+        wins = defaultdict(int)
+
+        for city in self.errors_by_city:
+            best = self.best_model_for_city(city)
+            if best is not None:
+                wins[best] += 1
+
+        def sort_key(item):
+            model, count = item
+            overall = self.errors.get(model, [])
+            avg = float(np.mean(overall)) if overall else float("inf")
+            return (-count, avg)
+
+        rows = sorted(wins.items(), key=sort_key)
+
+        return rows
+
     def snapshot_leaderboard(self, path="leaderboard.csv"):
         by_city = self.leaderboard_by_city()
         if not by_city:
