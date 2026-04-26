@@ -6,7 +6,11 @@ class TelegramAlerts:
     def __init__(self):
         self.token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        self.base_url = f"https://api.telegram.org/bot{self.token}"
+
+        self.base_url = (
+            f"https://api.telegram.org/bot{self.token}"
+            if self.token else None
+        )
 
     def send(self, message: str):
         if not self.token or not self.chat_id:
@@ -16,11 +20,8 @@ class TelegramAlerts:
         try:
             requests.post(
                 f"{self.base_url}/sendMessage",
-                json={
-                    "chat_id": self.chat_id,
-                    "text": message
-                },
+                json={"chat_id": self.chat_id, "text": message},
                 timeout=5
             )
         except Exception as e:
-            print("Telegram error:", e)
+            print("Telegram error:", repr(e))
