@@ -8,6 +8,8 @@ import numpy as np
 class ModelEngine:
     def __init__(self):
         self.errors = defaultdict(list)
+        self.errors_by_city = defaultdict(lambda: defaultdict(list))
+        self.forecasts = {}
 
     def log_row(self, city, model, predicted, actual, error):
         file_exists = os.path.isfile("model_log.csv")
@@ -29,7 +31,9 @@ class ModelEngine:
 
     def process_event(self, event):
         if event.get("type") == "forecast":
-            self.forecast = event
+            city = event.get("city")
+            if city is not None:
+                self.forecasts[city] = event
 
         if event.get("type") == "observation":
             self.compare(event)
@@ -38,12 +42,8 @@ class ModelEngine:
         city = obs.get("city")
         actual = obs.get("value")
 
-        if not hasattr(self, "forecast"):
-            return
-
-        f = self.forecast
-
-        if f.get("city") != city:
+        f = self.forecasts.get(city)
+        if f is None:
             return
 
         model = f.get("model")
@@ -52,6 +52,9 @@ class ModelEngine:
         error = abs(predicted - actual)
 
         self.errors[model].append(error)
+        self.errors_by_city[city][model].append(error)
+
+        self.log_row(city, model, predicted, actual, error)
 
     def best_model(self):
         scores = {
@@ -64,3 +67,58 @@ class ModelEngine:
             return None
 
         return min(scores, key=scores.get)
+
+    def leaderboard(self):
+        rows = [
+            (m, float(np.mean(v)), len(v))
+            for m, v in self.errors.items()
+            if len(v) > 0
+        ]
+
+        rows.sort(key=lambda r: r[1])
+
+        return rows
+
+    def best_model_for_city(self, city):
+        scores = {
+            m: np.mean(v)
+            for m, v in self.errors_by_city.get(city, {}).items()
+            if len(v) > 0
+        }
+
+        if not scores:
+            return None
+
+        return min(scores, key=scores.get)
+
+    def leaderboard_by_city(self):
+        result = {}
+
+        for city, models in self.errors_by_city.items():
+            rows = [
+                (m, float(np.mean(v)), len(v))
+                for m, v in models.items()
+                if len(v) > 0
+            ]
+            rows.sort(key=lambda r: r[1])
+            result[city] = rows
+
+        return result
+
+    def snapshot_leaderboard(self, path="leaderboard.csv"):
+        by_city = self.leaderboard_by_city()
+        if not by_city:
+            return
+
+        file_exists = os.path.isfile(path)
+        ts = time.time()
+
+        with open(path, "a", newline="") as f:
+            writer = csv.writer(f)
+
+            if not file_exists:
+                writer.writerow(["timestamp", "city", "model", "avg_error", "samples"])
+
+            for city, rows in by_city.items():
+                for model, avg_error, samples in rows:
+                    writer.writerow([ts, city, model, avg_error, samples])
