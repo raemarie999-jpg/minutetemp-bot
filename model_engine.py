@@ -9,30 +9,17 @@ from telegram_alerts import TelegramAlerts
 
 class ModelEngine:
     def __init__(self):
-        # =========================
-        # HISTORICAL MEMORY
-        # =========================
-        self.all_errors = defaultdict(list)
-
-        # =========================
-        # ROLLING WINDOWS
-        # =========================
-        self.window_size = 30
         self.rolling_errors = defaultdict(
-            lambda: defaultdict(lambda: deque(maxlen=self.window_size))
+            lambda: defaultdict(lambda: deque(maxlen=30))
         )
 
-        # =========================
-        # FORECAST MEMORY (TTL)
-        # =========================
         self.forecasts = {}
         self.forecast_ttl = 60 * 30
 
-        # =========================
-        # ALERT STATE
-        # =========================
         self.last_best_by_city = {}
         self.last_alert_time = {}
+
+        self.telegram = TelegramAlerts()
 
         self.alert_cooldowns = {
             "HIGH": 120,
@@ -40,56 +27,24 @@ class ModelEngine:
             "LOW": 300
         }
 
-        # =========================
-        # DAILY REPORT STATE
-        # =========================
         self.last_daily_summary = 0
         self.daily_summary_interval = 60 * 60 * 24
 
-        # =========================
-        # METRICS
-        # =========================
         self.metrics = {
-            "total_forecasts": 0,
-            "total_observations": 0,
-            "total_errors_logged": 0,
-            "model_flips": 0,
+            "forecasts": 0,
+            "observations": 0,
+            "errors": 0,
+            "flips": 0,
             "spikes": 0,
-            "low_confidence": 0,
+            "low_conf": 0,
         }
 
-        # =========================
-        # TELEGRAM
-        # =========================
-        self.telegram = TelegramAlerts()
-
-    # =========================================================
-    # LOGGING
-    # =========================================================
-    def log_row(self, city, model, predicted, actual, error):
-        file_exists = os.path.isfile("model_log.csv")
-
-        with open("model_log.csv", "a", newline="") as f:
-            writer = csv.writer(f)
-
-            if not file_exists:
-                writer.writerow(["timestamp", "city", "model", "predicted", "actual", "error"])
-
-            writer.writerow([
-                time.time(),
-                city,
-                model,
-                predicted,
-                actual,
-                error
-            ])
-
-    # =========================================================
+    # -------------------------
     # EVENT INGESTION
-    # =========================================================
+    # -------------------------
     def process_event(self, event):
         if event.get("type") == "forecast":
-            self.metrics["total_forecasts"] += 1
+            self.metrics["forecasts"] += 1
 
             city = event.get("city")
             model = event.get("model")
@@ -97,16 +52,16 @@ class ModelEngine:
             if city and model:
                 self.forecasts[(city, model)] = {
                     "event": event,
-                    "timestamp": time.time()
+                    "ts": time.time()
                 }
 
         elif event.get("type") == "observation":
-            self.metrics["total_observations"] += 1
+            self.metrics["observations"] += 1
             self.compare(event)
 
-    # =========================================================
-    # CORE ENGINE
-    # =========================================================
+    # -------------------------
+    # CORE LOGIC
+    # -------------------------
     def compare(self, obs):
         city = obs.get("city")
         actual = obs.get("value")
@@ -120,29 +75,23 @@ class ModelEngine:
             if c != city:
                 continue
 
-            if now - data["timestamp"] > self.forecast_ttl:
+            if now - data["ts"] > self.forecast_ttl:
                 continue
 
-            f = data["event"]
-            predicted = f.get("value")
-
+            predicted = data["event"].get("value")
             if predicted is None:
                 continue
 
             error = abs(predicted - actual)
 
-            self.all_errors[model].append(error)
             self.rolling_errors[city][model].append(error)
-
-            self.metrics["total_errors_logged"] += 1
-
-            self.log_row(city, model, predicted, actual, error)
+            self.metrics["errors"] += 1
 
         self.detect_alerts(city)
 
-    # =========================================================
-    # LIVE BEST MODEL
-    # =========================================================
+    # -------------------------
+    # BEST MODEL
+    # -------------------------
     def best_model_city(self, city):
         scores = {
             m: np.mean(v)
@@ -155,14 +104,13 @@ class ModelEngine:
 
         sorted_models = sorted(scores.items(), key=lambda x: x[1])
 
-        best = sorted_models[0][0]
-        gap = sorted_models[1][1] - sorted_models[0][1]
+        return sorted_models[0][0], (
+            sorted_models[1][1] - sorted_models[0][1]
+        )
 
-        return best, gap
-
-    # =========================================================
-    # PREDICTIVE MODEL (FINAL)
-    # =========================================================
+    # -------------------------
+    # PREDICTIVE MODEL
+    # -------------------------
     def predictive_best_model(self, city):
         scores = {}
 
@@ -172,121 +120,56 @@ class ModelEngine:
 
             arr = np.array(errors)
 
-            weights = np.linspace(0.5, 1.5, len(arr))
-            weighted_mean = np.average(arr, weights=weights)
-
+            weighted = np.average(arr, weights=np.linspace(0.5, 1.5, len(arr)))
             slope = np.polyfit(np.arange(len(arr)), arr, 1)[0]
+            vol = np.std(arr)
 
-            volatility = np.std(arr)
+            scores[model] = weighted + 0.8 * slope + 0.5 * vol
 
-            score = weighted_mean + (0.8 * slope) + (0.5 * volatility)
+        return min(scores, key=scores.get) if scores else None
 
-            scores[model] = score
-
-        if not scores:
-            return None
-
-        return min(scores, key=scores.get)
-
-    # =========================================================
+    # -------------------------
     # ALERT SYSTEM
-    # =========================================================
-    def send_alert(self, city, level, message):
+    # -------------------------
+    def send_alert(self, city, level, msg):
         now = time.time()
-
         key = (city, level)
-        cooldown = self.alert_cooldowns.get(level, 60)
 
-        if now - self.last_alert_time.get(key, 0) < cooldown:
+        if now - self.last_alert_time.get(key, 0) < self.alert_cooldowns[level]:
             return
 
         self.last_alert_time[key] = now
-        self.telegram.send(message)
+        self.telegram.send(msg)
 
-        if "Flip" in message:
-            self.metrics["model_flips"] += 1
-        elif "Spike" in message:
-            self.metrics["spikes"] += 1
-        elif "Confidence" in message:
-            self.metrics["low_confidence"] += 1
-
-    # =========================================================
+    # -------------------------
     # ALERT LOGIC
-    # =========================================================
+    # -------------------------
     def detect_alerts(self, city):
         live_best, gap = self.best_model_city(city)
         pred_best = self.predictive_best_model(city)
 
         prev = self.last_best_by_city.get(city)
 
-        # MODEL FLIP
         if prev and live_best and prev != live_best:
-            self.send_alert(
-                city,
-                "HIGH",
-                f"🔁 Model Flip ({city})\n{prev} → {live_best}\nGap: {gap:.2f}"
-            )
+            self.metrics["flips"] += 1
+            self.send_alert(city, "HIGH", f"🔁 Flip {city}: {prev} → {live_best}")
+
+        if gap is not None and gap < 0.5:
+            self.metrics["low_conf"] += 1
+            self.send_alert(city, "LOW", f"⚠️ Low confidence {city}")
+
+        if pred_best and live_best and pred_best != live_best:
+            self.send_alert(city, "HIGH", f"🔮 Shift {city}: {pred_best} → {live_best}")
 
         self.last_best_by_city[city] = live_best
 
-        # LOW CONFIDENCE
-        if gap is not None and gap < 0.5:
-            self.send_alert(
-                city,
-                "LOW",
-                f"⚠️ Low Confidence ({city})\nGap: {gap:.2f}"
-            )
-
-        # SPIKE
-        for model, errors in self.rolling_errors[city].items():
-            if len(errors) < 10:
-                continue
-
-            current = errors[-1]
-            baseline = np.mean(list(errors)[:-1])
-
-            if baseline > 0 and current > baseline * 1.5:
-                self.send_alert(
-                    city,
-                    "MEDIUM",
-                    f"🚨 Error Spike ({city})\n{model}"
-                )
-
-        # PREDICTIVE SHIFT
-        if pred_best and live_best and pred_best != live_best:
-            self.send_alert(
-                city,
-                "HIGH",
-                f"🔮 Forecast Shift ({city})\nLive: {live_best}\nPredicted: {pred_best}"
-            )
-
-        # DAILY SUMMARY
-        self.run_daily_summary()
-
-    # =========================================================
+    # -------------------------
     # DAILY SUMMARY
-    # =========================================================
-    def generate_daily_summary(self):
-        lines = ["📊 DAILY MODEL SUMMARY\n"]
+    # -------------------------
+    def daily_summary(self):
+        lines = ["📊 DAILY SUMMARY"]
 
-        for city in self.rolling_errors:
-            live_best, _ = self.best_model_city(city)
-            pred_best = self.predictive_best_model(city)
-
-            lines.append(f"📍 {city.upper()}")
-            lines.append(f"Live: {live_best}")
-            lines.append(f"Predicted: {pred_best}\n")
-
-        lines.append("📈 METRICS")
         for k, v in self.metrics.items():
             lines.append(f"{k}: {v}")
 
         return "\n".join(lines)
-
-    def run_daily_summary(self):
-        now = time.time()
-
-        if now - self.last_daily_summary > self.daily_summary_interval:
-            msg = self.generate_daily_summary()
-            self.telegram.send(msg)
-            self.last_daily_summary = now
