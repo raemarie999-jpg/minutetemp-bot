@@ -1,5 +1,11 @@
 import json
 import websocket
+import requests
+
+API_KEY = "mt_663bb9c8e723a581d28130ddde325251694d086d9753f009cd7019348435e5c9"
+
+TICKET_URL = "https://api.minutetemp.com/v1/realtime/ticket"
+WS_BASE = "wss://stream.minutetemp.com/v1/realtime"
 
 CITIES = ["nyc"]
 
@@ -7,16 +13,30 @@ print("🔥 BOT STARTING")
 print("🌍 CITIES:", CITIES)
 
 
-def safe_get(msg, key, default=None):
-    return msg.get(key, default)
+def get_ticket():
+    print("📡 Requesting ticket...")
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}"
+    }
+
+    res = requests.post(TICKET_URL, headers=headers)
+
+    print("📨 Ticket status:", res.status_code)
+
+    if res.status_code != 200:
+        print("❌ Failed to get ticket")
+        print(res.text)
+        return None
+
+    data = res.json()
+    print("📨 Ticket response:", data)
+
+    # 🔑 IMPORTANT: confirm actual field name here
+    return data.get("ticket")
 
 
 def handle_message(msg):
-    if not isinstance(msg, dict):
-        print("⚠️ Non-dict message received")
-        print(msg)
-        return
-
     msg_type = msg.get("type")
 
     if msg_type == "subscribed":
@@ -28,53 +48,27 @@ def handle_message(msg):
         print(f"{msg.get('slug')} | {msg.get('station_id')}")
         print(f"Temp: {msg.get('temperature_f')}°F")
 
-    elif msg_type == "weather_event":
-        print("\n⚠️ WEATHER EVENT")
-        print(msg.get("summary", "No summary"))
-
-    elif msg_type == "forecast_versions":
-        versions = msg.get("versions", {})
-        print("\n📊 FORECAST UPDATE")
-        print(f"{msg.get('slug')} ({msg.get('station_id')})")
-        print(f"Models: {len(versions)}")
-
-    elif msg_type == "oracle_scores_updated":
-        print("\n📈 MODEL SCORES UPDATED")
-        print(msg.get("slug"))
-        print("Modes:", msg.get("modes"))
-
-    elif msg_type is None:
-        print("⚠️ Message missing type field")
-        print(msg)
-
     else:
-        print("\n📩 UNHANDLED MESSAGE TYPE:", msg_type)
-        print(msg)
+        print("\n📩", msg_type)
 
 
 def on_message(ws, message):
     try:
         data = json.loads(message)
         handle_message(data)
-
-    except json.JSONDecodeError:
-        print("❌ Invalid JSON received")
-        print(message)
-
     except Exception as e:
-        print("❌ Handler crash:", e)
+        print("❌ Parse error:", e)
         print(message)
 
 
 def on_open(ws):
     print("🔌 WebSocket connected")
 
-    payload = {
+    ws.send(json.dumps({
         "type": "subscribe",
         "cities": CITIES
-    }
+    }))
 
-    ws.send(json.dumps(payload))
     print("📡 Subscribed to cities")
 
 
@@ -83,17 +77,23 @@ def on_error(ws, error):
 
 
 def on_close(ws, close_status_code, close_msg):
-    print("🔌 WebSocket closed:", close_status_code, close_msg)
+    print("🔌 WebSocket closed", close_status_code, close_msg)
 
 
 if __name__ == "__main__":
     print("🚀 ENTERING MAIN LOOP")
 
-    WS_URL = "wss://YOUR_WEBSOCKET_URL_HERE"
+    ticket = get_ticket()
 
-    if "YOUR_WEBSOCKET_URL_HERE" in WS_URL:
-        print("❌ ERROR: WebSocket URL is not set")
+    if not ticket:
+        print("❌ No ticket — cannot continue")
         exit(1)
+
+    print("🎟 Using ticket:", ticket)
+
+    WS_URL = f"{WS_BASE}?ticket={ticket}"
+
+    print("🔌 Opening WebSocket:", WS_URL)
 
     ws = websocket.WebSocketApp(
         WS_URL,
