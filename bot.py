@@ -28,6 +28,16 @@ CITIES = [
     if c.strip()
 ]
 
+# Which prediction market we're tracking. Determines which station per city
+# we accept observations/scores for. Options: kalshi, polymarket, robinhood,
+# ibkr, all (no filter).
+MARKET = os.getenv("MARKET", "kalshi").lower()
+
+CITIES_CATALOG_URL = os.getenv(
+    "MINUTETEMP_CITIES_URL",
+    "https://api.minutetemp.com/api/v1/cities",
+)
+
 RECONNECT_DELAY = 5
 MAX_RECONNECT_DELAY = 60
 
@@ -39,6 +49,76 @@ if not API_KEY:
     sys.exit(1)
 
 engine = ModelEngine()
+
+# Track which requested cities have been confirmed by the server.
+_accepted_cities: set = set()
+_subscribe_responses = 0
+_subscribe_summary_printed = False
+
+# city_slug -> set of station_ids we accept events from (based on MARKET).
+ALLOWED_STATIONS: dict = {}
+
+
+def _build_allowed_stations() -> dict:
+    """Hit MinuteTemp's catalog and pick the station per city that the chosen
+    prediction market actually settles against (e.g. Kalshi uses Central Park
+    for NYC, not LaGuardia)."""
+    if MARKET == "all":
+        print("🎯 MARKET filter: all (no station filtering)", flush=True)
+        return {}
+
+    try:
+        res = requests.get(
+            CITIES_CATALOG_URL,
+            headers={"X-API-Key": API_KEY},
+            timeout=10,
+        )
+        res.raise_for_status()
+        catalog = res.json().get("data", [])
+    except Exception as e:
+        print(
+            f"⚠️ Could not fetch city catalog ({e!r}); accepting all stations",
+            flush=True,
+        )
+        return {}
+
+    flag = f"{MARKET}_active"
+    allowed: dict = {}
+
+    for city in catalog:
+        slug = city.get("slug")
+        if slug not in CITIES:
+            continue
+        stations = [
+            s.get("station_id")
+            for s in (city.get("stations") or [])
+            if s.get(flag) and s.get("station_id")
+        ]
+        if stations:
+            allowed[slug] = set(stations)
+
+    print(f"🎯 MARKET filter: {MARKET}", flush=True)
+    for slug in CITIES:
+        sids = sorted(allowed.get(slug, set()))
+        if sids:
+            print(f"   {slug}: {sids}", flush=True)
+        else:
+            print(
+                f"   {slug}: ⚠️ no {MARKET}_active station in catalog",
+                flush=True,
+            )
+    return allowed
+
+
+def _station_allowed(city: str, station_id) -> bool:
+    """If we built a filter for this city, only accept matching stations."""
+    if not ALLOWED_STATIONS:
+        return True
+    allowed = ALLOWED_STATIONS.get(city)
+    if not allowed:
+        # No filter for this city -> accept everything (fail open).
+        return True
+    return station_id in allowed
 
 
 # -------------------------
@@ -76,6 +156,7 @@ def get_ticket():
 # -------------------------
 def feed_observation(msg):
     city = msg.get("slug") or msg.get("city")
+    station_id = msg.get("station_id")
     value = msg.get("temperature_f")
     if value is None:
         value = msg.get("value")
@@ -83,10 +164,13 @@ def feed_observation(msg):
     if city is None or value is None:
         return
 
+    if not _station_allowed(city, station_id):
+        return
+
     engine.process_event({
         "type": "observation",
         "city": city,
-        "station_id": msg.get("station_id"),
+        "station_id": station_id,
         "value": float(value),
     })
 
@@ -100,6 +184,9 @@ def feed_oracle_scores(msg):
         return
 
     station_id = msg.get("station_id")
+    if not _station_allowed(city, station_id):
+        return
+
     modes = msg.get("modes") or ["overall"]
 
     for mode in modes:
@@ -127,13 +214,25 @@ def handle_message(msg):
     msg_type = msg.get("type")
 
     if msg_type == "subscribed":
-        print("✅ SUBSCRIBED", flush=True)
-        print("Accepted:", msg.get("accepted"), flush=True)
+        global _subscribe_responses
+        _subscribe_responses += 1
+        accepted = msg.get("accepted") or {}
+        accepted_cities = accepted.get("cities") or []
+        if accepted_cities:
+            for c in accepted_cities:
+                _accepted_cities.add(c)
+            print(f"✅ SUBSCRIBED → {accepted_cities}", flush=True)
+        else:
+            print("⚠️ SUBSCRIBE REJECTED (no cities accepted)", flush=True)
+        _maybe_print_subscribe_summary()
 
     elif msg_type == "observation":
+        slug = msg.get("slug")
+        station_id = msg.get("station_id")
+        keep = "✓" if _station_allowed(slug, station_id) else "✗"
         print(
-            f"\n🌡 OBSERVATION {msg.get('slug')} | "
-            f"{msg.get('station_id')} | {msg.get('temperature_f')}°F",
+            f"\n🌡 OBSERVATION {slug} | {station_id} {keep} | "
+            f"{msg.get('temperature_f')}°F",
             flush=True,
         )
         feed_observation(msg)
@@ -159,6 +258,24 @@ def handle_message(msg):
     engine.maybe_send_daily_summary()
 
 
+def _maybe_print_subscribe_summary():
+    """Once we've received a `subscribed` reply for every subscribe call we
+    sent, print a summary so any rejected cities are obvious."""
+    global _subscribe_summary_printed
+    if _subscribe_summary_printed:
+        return
+    if _subscribe_responses < len(CITIES):
+        return
+    _subscribe_summary_printed = True
+    rejected = [c for c in CITIES if c not in _accepted_cities]
+    if rejected:
+        print(
+            f"⚠️ Cities rejected by API (likely tier/access): {rejected}",
+            flush=True,
+        )
+    print(f"✅ Streaming cities: {sorted(_accepted_cities)}", flush=True)
+
+
 # -------------------------
 # WEBSOCKET CALLBACKS
 # -------------------------
@@ -172,8 +289,10 @@ def on_message(ws, message):
 
 def on_open(ws):
     print("🔌 WebSocket connected", flush=True)
-    ws.send(json.dumps({"type": "subscribe", "cities": CITIES}))
-    print("📡 Subscribed to cities", flush=True)
+    # Subscribe per city so an unknown slug doesn't kill the whole batch.
+    for city in CITIES:
+        ws.send(json.dumps({"type": "subscribe", "cities": [city]}))
+        print(f"📡 Subscribe sent: {city}", flush=True)
 
 
 def on_error(ws, error):
@@ -207,6 +326,9 @@ def run_once():
 
 
 def main():
+    global ALLOWED_STATIONS
+    ALLOWED_STATIONS = _build_allowed_stations()
+
     print("🚀 ENTERING MAIN LOOP", flush=True)
     delay = RECONNECT_DELAY
     while True:
