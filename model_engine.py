@@ -1,4 +1,3 @@
-import csv
 import os
 import time
 from collections import defaultdict, deque
@@ -9,109 +8,63 @@ import numpy as np
 from telegram_alerts import TelegramAlerts
 
 
-LOG_DIR = os.getenv(
-    "WORKER_LOG_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
-)
-
-
-# -------------------------
-# UTIL
-# -------------------------
-def _now_iso():
+def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# -------------------------
-# CSV LOGGER
-# -------------------------
-class CsvLogger:
-    def __init__(self, path, header):
-        self.path = path
-        self.header = header
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self._ensure_header()
-
-    def _ensure_header(self):
-        if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
-            with open(self.path, "w", newline="") as f:
-                csv.writer(f).writerow(self.header)
-
-    def write(self, row):
-        try:
-            self._ensure_header()
-            with open(self.path, "a", newline="") as f:
-                csv.writer(f).writerow(row)
-        except Exception as e:
-            print("⚠️ CSV write error:", repr(e), flush=True)
-
-
-# -------------------------
-# MODEL ENGINE
-# -------------------------
 class ModelEngine:
     def __init__(self):
-        self.telegram = TelegramAlerts()
-
-        # city -> model -> deque(errors)
+        # city -> model -> deque of recent errors
         self.errors = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50)))
 
-        # last alert timestamps
+        # last decision per city
+        self.current_best = {}
         self.last_alert_time = {}
 
-        # last best model (for flip detection)
-        self.last_best = {}
+        self.telegram = TelegramAlerts()
 
-        # logs
-        self.obs_log = CsvLogger(
-            os.path.join(LOG_DIR, "observations.csv"),
-            ["ts", "city", "station", "temp"],
-        )
+        # cooldowns to avoid spam
+        self.cooldowns = {
+            "CHANGE": 120,
+            "WEAK": 300,
+        }
 
-        self.score_log = CsvLogger(
-            os.path.join(LOG_DIR, "scores.csv"),
-            ["ts", "city", "model", "mae"],
-        )
-
-        self.decision_log = CsvLogger(
-            os.path.join(LOG_DIR, "decisions.csv"),
-            ["ts", "city", "best_model", "score"],
-        )
-
-        print("🧠 ModelEngine initialized", flush=True)
+        # weights for different oracle modes
+        self.mode_weights = {
+            "day_of": 1.5,
+            "day_ahead": 1.2,
+            "overall": 1.0,
+        }
 
     # -------------------------
-    # EVENT ENTRYPOINT
+    # MAIN ENTRY
     # -------------------------
     def process_event(self, event):
-        t = event.get("type")
+        etype = event.get("type")
 
-        if t == "observation":
-            self._handle_observation(event)
-
-        elif t == "oracle_scores":
+        if etype == "oracle_scores":
             self._handle_scores(event)
 
-    # -------------------------
-    # OBSERVATIONS
-    # -------------------------
-    def _handle_observation(self, e):
-        city = e.get("city")
-        temp = e.get("value")
-        station = e.get("station_id")
+        elif etype == "observation":
+            # currently unused for ranking (future expansion)
+            pass
 
-        if city and temp is not None:
-            self.obs_log.write([_now_iso(), city, station, temp])
+        elif etype == "forecast":
+            # placeholder for future forecast evaluation
+            pass
 
     # -------------------------
-    # ORACLE SCORES (CORE)
+    # INGEST SCORES
     # -------------------------
-    def _handle_scores(self, e):
-        city = e.get("city")
-        scores = e.get("scores") or []
+    def _handle_scores(self, event):
+        city = event.get("city")
+        scores = event.get("scores") or []
+        mode = event.get("mode", "overall")
 
-        if not city:
+        if not city or not scores:
             return
+
+        weight = self.mode_weights.get(mode, 1.0)
 
         for s in scores:
             model = s.get("model_id")
@@ -125,94 +78,83 @@ class ModelEngine:
             except:
                 continue
 
-            self.errors[city][model].append(mae)
-            self.score_log.write([_now_iso(), city, model, mae])
+            # weighted insert (more weight = more influence)
+            self.errors[city][model].append(mae * weight)
 
-        # 🔥 After updating scores → recompute best model
-        self.evaluate_city(city)
-
-    # -------------------------
-    # CORE SCORING LOGIC
-    # -------------------------
-    def score_model(self, errors):
-        """
-        Combine:
-        - weighted MAE (recent matters more)
-        - trend (getting better/worse)
-        - volatility (penalize unstable models)
-        """
-
-        if len(errors) < 5:
-            return None
-
-        arr = np.array(errors)
-
-        # recent weighting
-        weights = np.linspace(0.5, 1.5, len(arr))
-        weighted_mae = np.average(arr, weights=weights)
-
-        # trend (slope)
-        slope = np.polyfit(np.arange(len(arr)), arr, 1)[0]
-
-        # volatility
-        volatility = np.std(arr)
-
-        # final score (lower is better)
-        return weighted_mae + (0.7 * slope) + (0.5 * volatility)
+        self._evaluate_city(city)
 
     # -------------------------
-    # EVALUATE BEST MODEL
+    # CORE LOGIC
     # -------------------------
-    def evaluate_city(self, city):
-        models = self.errors[city]
+    def _evaluate_city(self, city):
+        model_scores = {}
 
-        scores = {}
+        for model, vals in self.errors[city].items():
+            if len(vals) < 5:
+                continue
 
-        for model, errs in models.items():
-            score = self.score_model(errs)
-            if score is not None:
-                scores[model] = score
+            arr = np.array(vals)
 
-        if len(scores) < 2:
+            avg = np.mean(arr)
+            trend = np.polyfit(range(len(arr)), arr, 1)[0]  # slope
+            vol = np.std(arr)
+
+            # lower is better
+            score = avg + 0.7 * trend + 0.5 * vol
+
+            model_scores[model] = score
+
+        if len(model_scores) < 2:
             return
 
-        best = min(scores, key=scores.get)
-        best_score = scores[best]
+        ranked = sorted(model_scores.items(), key=lambda x: x[1])
 
-        self.decision_log.write([
-            _now_iso(),
-            city,
-            best,
-            best_score,
-        ])
+        best_model, best_score = ranked[0]
+        second_score = ranked[1][1]
 
-        print(f"🏆 BEST MODEL {city}: {best} ({best_score:.3f})", flush=True)
+        gap = second_score - best_score
 
-        self._maybe_alert(city, best, best_score)
+        prev_best = self.current_best.get(city)
 
-    # -------------------------
-    # ALERT LOGIC
-    # -------------------------
-    def _maybe_alert(self, city, best, score):
-        prev = self.last_best.get(city)
-        now = time.time()
+        # -------------------------
+        # PRINT ALWAYS (LIVE OUTPUT)
+        # -------------------------
+        print(
+            f"🏆 BEST {city.upper()} → {best_model} "
+            f"(gap: {gap:.3f})",
+            flush=True,
+        )
 
-        cooldown = 120
+        # -------------------------
+        # ALERTS
+        # -------------------------
+        if prev_best and prev_best != best_model:
+            self._alert(city, "CHANGE",
+                        f"🔁 {city.upper()} model flip: {prev_best} → {best_model}")
 
-        if prev and prev != best:
-            key = f"{city}_flip"
+        if gap < 0.3:
+            self._alert(city, "WEAK",
+                        f"⚠️ {city.upper()} weak signal (models close)")
 
-            if now - self.last_alert_time.get(key, 0) > cooldown:
-                self.last_alert_time[key] = now
-
-                msg = f"🔁 {city.upper()} model flip: {prev} → {best}"
-                print("🚨", msg, flush=True)
-                self.telegram.send(msg)
-
-        self.last_best[city] = best
+        self.current_best[city] = best_model
 
     # -------------------------
-    # DAILY SUMMARY (optional)
+    # ALERT SYSTEM
+    # -------------------------
+    def _alert(self, city, level, msg):
+        now_ts = time.time()
+        key = (city, level)
+
+        if now_ts - self.last_alert_time.get(key, 0) < self.cooldowns[level]:
+            return
+
+        self.last_alert_time[key] = now_ts
+
+        print(f"🚨 ALERT: {msg}", flush=True)
+        self.telegram.send(msg)
+
+    # -------------------------
+    # DAILY SUMMARY (OPTIONAL)
     # -------------------------
     def maybe_send_daily_summary(self):
         pass
