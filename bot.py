@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import requests
 import websocket
 
@@ -40,51 +41,56 @@ engine = ModelEngine()
 # MESSAGE HANDLER
 # -------------------------
 def handle_message(msg):
-    print("📥 HANDLE:", msg.get("type"), flush=True)
     msg_type = msg.get("type")
+    print("📥 HANDLE:", msg_type, flush=True)
 
+    # -------------------------
+    # SUBSCRIBED
+    # -------------------------
     if msg_type == "subscribed":
-        print("✅ SUBSCRIBED", msg.get("accepted"), flush=True)
+        print("✅ SUBSCRIBED:", msg.get("accepted"), flush=True)
 
-elif msg_type == "observation":
-    temp_f = msg.get("temperature_f")
+    # -------------------------
+    # OBSERVATION (MAIN DATA STREAM)
+    # -------------------------
+    elif msg_type == "observation":
+        city = msg.get("slug")
+        station_id = msg.get("station_id")
 
-    # fallback safety (API sometimes sends different shapes or nulls)
-    if temp_f is None:
-        temp_f = msg.get("temp_f")
-    if temp_f is None:
-        temp_f = msg.get("value")
+        temp_f = (
+            msg.get("temperature_f")
+            or msg.get("temp_f")
+            or msg.get("value")
+        )
 
-    try:
-        temp_str = f"{float(temp_f):.1f}°F"
-    except (TypeError, ValueError):
-        temp_str = "N/A"
+        try:
+            temp_display = f"{float(temp_f):.1f}°F"
+        except (TypeError, ValueError):
+            temp_display = "N/A"
 
-    print(
-        f"\n🌡 OBSERVATION {msg.get('slug')} | "
-        f"{msg.get('station_id')} | "
-        f"{temp_str}",
-        flush=True,
-    )
+        print(
+            f"🌡 OBSERVATION {city} | {station_id} | {temp_display}",
+            flush=True,
+        )
 
-    engine.process_event({
-        "type": "observation",
-        "city": msg.get("slug"),
-        "station_id": msg.get("station_id"),
-        "value": temp_f,
-    })
         engine.process_event({
             "type": "observation",
-            "city": msg.get("slug"),
-            "station_id": msg.get("station_id"),
-            "value": msg.get("temperature_f"),
+            "city": city,
+            "station_id": station_id,
+            "value": temp_f,
         })
 
+    # -------------------------
+    # FORECAST METADATA
+    # -------------------------
     elif msg_type == "forecast_versions":
-        print("\n📊 FORECAST UPDATE", msg.get("slug"), flush=True)
+        print("📊 FORECAST UPDATE:", msg.get("slug"), flush=True)
 
+    # -------------------------
+    # ORACLE SCORES (MODEL EVALUATION)
+    # -------------------------
     elif msg_type == "oracle_scores_updated":
-        print("\n📈 MODEL SCORES UPDATED", msg.get("slug"), flush=True)
+        print("📈 MODEL SCORES UPDATED:", msg.get("slug"), flush=True)
 
         engine.process_event({
             "type": "oracle_scores",
@@ -94,11 +100,23 @@ elif msg_type == "observation":
             "scores": msg.get("overall", {}).get("scores", []),
         })
 
+    # -------------------------
+    # WEATHER EVENTS
+    # -------------------------
     elif msg_type == "weather_event":
-        print("\n⚠️ WEATHER EVENT", msg.get("summary"), flush=True)
+        print("⚠️ WEATHER EVENT:", msg.get("summary"), flush=True)
 
+    # -------------------------
+    # IGNORE PRICE NOISE (OPTIONAL)
+    # -------------------------
+    elif msg_type in ["price_update", "forecast_updated"]:
+        print("📩 IGNORED:", msg_type, flush=True)
+
+    # -------------------------
+    # FALLBACK
+    # -------------------------
     else:
-        print("\n📩 MSG:", msg_type, flush=True)
+        print("📩 UNKNOWN:", msg_type, msg, flush=True)
 
     engine.maybe_send_daily_summary()
 
@@ -134,7 +152,7 @@ def on_close(ws, close_status_code, close_msg):
 
 
 # -------------------------
-# GET TICKET (ONCE ONLY)
+# GET TICKET (ONLY ONCE)
 # -------------------------
 def get_ticket():
     print("📡 Requesting ticket...", flush=True)
@@ -152,13 +170,12 @@ def get_ticket():
     print("📨 Ticket status:", res.status_code, flush=True)
 
     if res.status_code != 200:
-        print("❌ Failed to get ticket", flush=True)
-        print(res.text, flush=True)
+        print("❌ Failed to get ticket:", res.text, flush=True)
         return None
 
     data = res.json()
-
     inner = data.get("data")
+
     if isinstance(inner, dict):
         return inner.get("ticket")
 
@@ -166,7 +183,7 @@ def get_ticket():
 
 
 # -------------------------
-# SINGLE CONNECTION (MODEL A)
+# CONNECT (SINGLE SESSION)
 # -------------------------
 def connect():
     ticket = get_ticket()
