@@ -15,9 +15,9 @@ LOG_DIR = os.getenv(
 )
 
 
-# -------------------------
+# =========================
 # CSV LOGGER
-# -------------------------
+# =========================
 class CsvLogger:
     def __init__(self, path: str, header: list):
         self.path = path
@@ -36,39 +36,24 @@ class CsvLogger:
             with open(self.path, "a", newline="") as f:
                 csv.writer(f).writerow(row)
         except Exception as e:
-            print("⚠️ CSV error:", repr(e), flush=True)
+            print(f"⚠️ CSV write error ({self.path}):", repr(e), flush=True)
 
 
-def _now():
+def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# -------------------------
-# MODEL ENGINE v2
-# -------------------------
+# =========================
+# MODEL ENGINE
+# =========================
 class ModelEngine:
-    """
-    Two-mode system:
-
-    1) OVERALL MODE (slow signal)
-       - uses: overall oracle_scores
-       - stable ranking
-
-    2) SHORT TERM MODE (fast signal)
-       - uses: day_ahead + day_of
-       - reactive / live reliability
-    """
-
     def __init__(self):
         # city -> mode -> model -> deque(errors)
-        self.errors = defaultdict(
-            lambda: {
-                "overall": defaultdict(lambda: deque(maxlen=30)),
-                "short": defaultdict(lambda: deque(maxlen=30)),
-            }
+        self.rolling_errors = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(lambda: deque(maxlen=30)))
         )
 
-        self.last_best = {}  # city -> model
+        self.last_best_by_city = {}
         self.last_alert_time = {}
 
         self.telegram = TelegramAlerts()
@@ -79,11 +64,14 @@ class ModelEngine:
             "LOW": 300,
         }
 
+        self.last_daily_summary = 0
+        self.daily_summary_interval = 86400
+
         self.metrics = {
             "observations": 0,
-            "oracle_updates": 0,
+            "errors": 0,
             "flips": 0,
-            "alerts": 0,
+            "low_conf": 0,
         }
 
         # logs
@@ -92,53 +80,59 @@ class ModelEngine:
             ["ts", "city", "station_id", "value"],
         )
 
-        self.oracle_log = CsvLogger(
-            os.path.join(LOG_DIR, "oracle.csv"),
-            ["ts", "city", "mode", "model_id", "mae"],
+        self.scores_log = CsvLogger(
+            os.path.join(LOG_DIR, "scores.csv"),
+            [
+                "ts", "city", "station_id", "mode",
+                "model_id", "model_name", "combined_mae"
+            ],
+        )
+
+        self.decision_log = CsvLogger(
+            os.path.join(LOG_DIR, "decisions.csv"),
+            ["ts", "city", "best_model", "score_gap"],
         )
 
         self.alert_log = CsvLogger(
             os.path.join(LOG_DIR, "alerts.csv"),
-            ["ts", "city", "level", "msg", "sent"],
+            ["ts", "city", "level", "message", "sent"],
         )
 
-    # -------------------------
-    # EVENT ENTRY
-    # -------------------------
+    # =========================
+    # EVENT INGESTION
+    # =========================
     def process_event(self, event):
-        if event["type"] == "observation":
+        etype = event.get("type")
+
+        if etype == "observation":
             self.metrics["observations"] += 1
-            self._obs(event)
 
-        elif event["type"] == "oracle_scores":
-            self.metrics["oracle_updates"] += 1
-            self._oracle(event)
+            self.obs_log.write([
+                _now_iso(),
+                event.get("city"),
+                event.get("station_id"),
+                event.get("value"),
+            ])
 
-    # -------------------------
-    # OBSERVATIONS
-    # -------------------------
-    def _obs(self, e):
-        self.obs_log.write([
-            _now(),
-            e["city"],
-            e.get("station_id"),
-            e["value"],
-        ])
+        elif etype == "oracle_scores":
+            self.process_oracle_scores(event)
 
-    # -------------------------
-    # ORACLE SCORES (CORE FIX HERE)
-    # -------------------------
-    def _oracle(self, e):
-        city = e["city"]
-        mode = e.get("mode", "overall")
-        scores = e.get("scores", [])
+    # =========================
+    # STORE SCORES (MULTI-MODE)
+    # =========================
+    def process_oracle_scores(self, event):
+        city = event.get("city")
+        mode = event.get("mode")
+        scores = event.get("scores") or []
 
-        bucket = "overall" if mode == "overall" else "short"
+        if not city or not mode:
+            return
 
         for s in scores:
-            mid = s.get("model_id")
+            model_id = s.get("model_id")
             mae = s.get("combined_mae")
-            if mid is None or mae is None:
+
+            if model_id is None or mae is None:
                 continue
 
             try:
@@ -146,98 +140,117 @@ class ModelEngine:
             except:
                 continue
 
-            self.errors[city][bucket][mid].append(mae)
+            self.rolling_errors[city][mode][model_id].append(mae)
+            self.metrics["errors"] += 1
 
-            self.oracle_log.write([
-                _now(),
+            self.scores_log.write([
+                _now_iso(),
                 city,
-                bucket,
-                mid,
+                event.get("station_id"),
+                mode,
+                model_id,
+                s.get("model_name"),
                 mae,
             ])
 
-        self._evaluate(city)
+    # =========================
+    # COMBINED MODEL SCORE
+    # =========================
+    def compute_weighted_scores(self, city):
+        weights = {
+            "overall": 0.2,
+            "day_ahead": 0.3,
+            "day_of": 0.5,
+        }
 
-    # -------------------------
-    # CORE RANKING
-    # -------------------------
-    def _rank(self, city, bucket):
-        scores = {}
+        model_scores = defaultdict(float)
+        model_counts = defaultdict(int)
 
-        for model, vals in self.errors[city][bucket].items():
-            if len(vals) < 5:
-                continue
-            scores[model] = float(np.mean(vals))
+        for mode, w in weights.items():
+            for model, errors in self.rolling_errors[city][mode].items():
+                if len(errors) < 3:
+                    continue
+
+                avg_error = np.mean(errors)
+                model_scores[model] += w * avg_error
+                model_counts[model] += 1
+
+        # require at least one mode
+        return {
+            m: model_scores[m]
+            for m in model_scores
+            if model_counts[m] > 0
+        }
+
+    # =========================
+    # BEST MODEL
+    # =========================
+    def best_model_city(self, city):
+        scores = self.compute_weighted_scores(city)
 
         if len(scores) < 2:
-            return None
+            return None, None
 
-        return sorted(scores.items(), key=lambda x: x[1])
+        sorted_models = sorted(scores.items(), key=lambda x: x[1])
 
-    # -------------------------
-    # BEST MODELS
-    # -------------------------
-    def _best_overall(self, city):
-        r = self._rank(city, "overall")
-        return r[0][0] if r else None
+        best = sorted_models[0]
+        second = sorted_models[1]
 
-    def _best_short(self, city):
-        r = self._rank(city, "short")
-        return r[0][0] if r else None
+        gap = second[1] - best[1]
 
-    # -------------------------
-    # ALERT LOGIC
-    # -------------------------
-    def _evaluate(self, city):
-        overall_best = self._best_overall(city)
-        short_best = self._best_short(city)
+        return best[0], gap
 
-        if not overall_best or not short_best:
-            return
-
-        prev = self.last_best.get(city)
-
-        # flip detection (short-term only)
-        if prev and prev != short_best:
-            self.metrics["flips"] += 1
-            self._alert(city, "HIGH", f"🔁 Flip {city}: {prev} → {short_best}")
-
-        # divergence signal (important insight)
-        if overall_best != short_best:
-            self._alert(
-                city,
-                "MEDIUM",
-                f"⚠️ Divergence {city}: long={overall_best} short={short_best}",
-            )
-
-        self.last_best[city] = short_best
-
-    # -------------------------
-    # TELEGRAM ALERTS
-    # -------------------------
-    def _alert(self, city, level, msg):
+    # =========================
+    # ALERTING
+    # =========================
+    def send_alert(self, city, level, msg):
         now = time.time()
         key = (city, level)
 
         if now - self.last_alert_time.get(key, 0) < self.alert_cooldowns[level]:
-            self.alert_log.write([_now(), city, level, msg, False])
+            self.alert_log.write([_now_iso(), city, level, msg, False])
             return
 
         self.last_alert_time[key] = now
         self.telegram.send(msg)
-        self.metrics["alerts"] += 1
+        self.alert_log.write([_now_iso(), city, level, msg, True])
 
-        self.alert_log.write([_now(), city, level, msg, True])
+    def detect_alerts(self, city):
+        best, gap = self.best_model_city(city)
+        prev = self.last_best_by_city.get(city)
 
-    # -------------------------
-    # OPTIONAL SUMMARY
-    # -------------------------
+        if prev and best and prev != best:
+            self.metrics["flips"] += 1
+            self.send_alert(city, "HIGH", f"🔁 Flip {city}: {prev} → {best}")
+
+        if gap is not None and gap < 0.3:
+            self.metrics["low_conf"] += 1
+            self.send_alert(city, "LOW", f"⚠️ Low confidence {city}")
+
+        if best:
+            self.decision_log.write([
+                _now_iso(),
+                city,
+                best,
+                gap,
+            ])
+
+        self.last_best_by_city[city] = best
+
+    # =========================
+    # DAILY SUMMARY
+    # =========================
     def daily_summary(self):
-        return (
-            "📊 DAILY SUMMARY\n"
-            + "\n".join(f"{k}: {v}" for k, v in self.metrics.items())
-        )
+        lines = ["📊 DAILY SUMMARY"]
+
+        for k, v in self.metrics.items():
+            lines.append(f"{k}: {v}")
+
+        return "\n".join(lines)
 
     def maybe_send_daily_summary(self):
-        # kept for compatibility (no-op timing logic can be added later)
-        pass
+        now = time.time()
+
+        if now - self.last_daily_summary >= self.daily_summary_interval:
+            self.last_daily_summary = now
+            self.telegram.send(self.daily_summary())
