@@ -36,102 +36,85 @@ if not API_KEY:
 
 engine = ModelEngine()
 
-# =========================================================
-# LIVE TRACKER
-# =========================================================
+# -------------------------
+# LIVE STREAM HANDLER (FAST DATA)
+# -------------------------
+def live_stream_handler(msg):
+    temp_f = msg.get("temperature_f")
 
-def live_observation(msg):
-    city = msg.get("slug")
-    station = msg.get("station_id")
-
-    temp = (
-        msg.get("temperature_f")
-        or msg.get("temp_f")
-        or msg.get("value")
-    )
+    # fallback safety (API inconsistency)
+    if temp_f is None:
+        temp_f = msg.get("temp_f")
+    if temp_f is None:
+        temp_f = msg.get("value")
 
     try:
-        temp_str = f"{float(temp):.1f}°F"
-    except:
+        temp_str = f"{float(temp_f):.1f}°F"
+    except (TypeError, ValueError):
         temp_str = "N/A"
 
-    print(f"🌡 LIVE {city} | {station} | {temp_str}", flush=True)
+    print(
+        f"🌡 OBSERVATION {msg.get('slug')} | "
+        f"{msg.get('station_id')} | {temp_str}",
+        flush=True,
+    )
 
     engine.process_event({
         "type": "observation",
-        "city": city,
-        "station_id": station,
-        "value": temp,
+        "city": msg.get("slug"),
+        "station_id": msg.get("station_id"),
+        "value": temp_f,
     })
 
 
-def live_stream_handler(msg):
-    if msg.get("type") == "observation":
-        live_observation(msg)
-
-
-# =========================================================
-# MODEL EVALUATOR (MULTI-MODE)
-# =========================================================
-
-def extract_scores(msg, mode):
-    block = msg.get(mode)
-    if not isinstance(block, dict):
-        return []
-    return block.get("scores", [])
-
-
-def model_oracle_scores(msg):
-    city = msg.get("slug")
-    if not city:
-        return
-
-    print("📈 ORACLE UPDATE:", city, flush=True)
-
-    for mode in ["overall", "day_ahead", "day_of"]:
-        scores = extract_scores(msg, mode)
-
-        if not scores:
-            continue
-
-        engine.process_event({
-            "type": "oracle_scores",
-            "city": city,
-            "station_id": msg.get("station_id"),
-            "mode": mode,
-            "scores": scores,
-        })
-
-
-def model_forecast_updated(msg):
-    city = msg.get("slug")
-
-    print("📊 FORECAST UPDATED:", city, flush=True)
-
-    # trigger re-evaluation using latest multi-mode data
-    engine.detect_alerts(city)
-
-
+# -------------------------
+# EVALUATION HANDLER (MODELS + FORECASTS)
+# -------------------------
 def evaluation_handler(msg):
     msg_type = msg.get("type")
 
     if msg_type == "oracle_scores_updated":
-        model_oracle_scores(msg)
+        print(f"📈 SCORES {msg.get('slug')}", flush=True)
+
+        for mode in ["overall", "day_ahead", "day_of"]:
+            block = msg.get(mode)
+            if not isinstance(block, dict):
+                continue
+
+            engine.process_event({
+                "type": "oracle_scores",
+                "city": msg.get("slug"),
+                "station_id": block.get("station_id"),
+                "mode": mode,
+                "scores": block.get("scores", []),
+            })
 
     elif msg_type == "forecast_updated":
-        model_forecast_updated(msg)
+        print(f"📊 FORECAST {msg.get('slug')}", flush=True)
+
+        engine.process_event({
+            "type": "forecast",
+            "city": msg.get("slug"),
+            "station_id": msg.get("station_id"),
+            "models": msg.get("models", []),
+        })
 
     elif msg_type == "forecast_versions":
-        print("📊 FORECAST VERSION:", msg.get("slug"), flush=True)
+        print(f"📊 FORECAST VERSION {msg.get('slug')}", flush=True)
 
     elif msg_type == "subscribed":
-        print("✅ SUBSCRIBED:", msg.get("accepted"), flush=True)
+        print("✅ SUBSCRIBED", msg.get("accepted"), flush=True)
+
+    elif msg_type == "weather_event":
+        print("⚠️ WEATHER EVENT", msg.get("summary"), flush=True)
+
+    else:
+        print("📩 IGNORED:", msg_type, flush=True)
 
 
-# =========================================================
-# ROUTER
-# =========================================================
-
+# -------------------------
+# MAIN MESSAGE ROUTER
+# -------------------------
 def handle_message(msg):
     msg_type = msg.get("type")
     print("📥 MSG:", msg_type, flush=True)
@@ -144,44 +127,29 @@ def handle_message(msg):
         "forecast_updated",
         "forecast_versions",
         "subscribed",
+        "weather_event",
     ]:
         evaluation_handler(msg)
+
+    else:
+        print("📩 UNKNOWN:", msg_type, flush=True)
 
     engine.maybe_send_daily_summary()
 
 
-# =========================================================
-# WEBSOCKET
-# =========================================================
-
-def get_ticket():
-    print("📡 Requesting ticket...", flush=True)
-
-    res = requests.post(
-        TICKET_URL,
-        headers={"X-API-Key": API_KEY},
-        timeout=10,
-    )
-
-    print("📨 Ticket status:", res.status_code, flush=True)
-
-    if res.status_code != 200:
-        print("❌ Ticket failed:", res.text, flush=True)
-        return None
-
-    data = res.json()
-    return data.get("data", {}).get("ticket") or data.get("ticket")
-
-
+# -------------------------
+# WEBSOCKET CALLBACKS
+# -------------------------
 def on_message(ws, message):
     try:
-        handle_message(json.loads(message))
+        data = json.loads(message)
+        handle_message(data)
     except Exception as e:
         print("❌ Parse error:", repr(e), flush=True)
 
 
 def on_open(ws):
-    print("🔌 Connected", flush=True)
+    print("🔌 WebSocket connected", flush=True)
 
     for city in CITIES:
         ws.send(json.dumps({
@@ -192,23 +160,56 @@ def on_open(ws):
 
 
 def on_error(ws, error):
-    print("❌ WS error:", error, flush=True)
+    print("❌ WebSocket error:", error, flush=True)
 
 
-def on_close(ws, code, msg):
-    print("🔌 Closed:", code, msg, flush=True)
+def on_close(ws, close_status_code, close_msg):
+    print("🔌 WebSocket closed", close_status_code, close_msg, flush=True)
 
 
-# =========================================================
-# MAIN
-# =========================================================
+# -------------------------
+# GET TICKET (ONCE)
+# -------------------------
+def get_ticket():
+    print("📡 Requesting ticket...", flush=True)
 
+    try:
+        res = requests.post(
+            TICKET_URL,
+            headers={"X-API-Key": API_KEY},
+            timeout=10,
+        )
+    except Exception as e:
+        print("❌ Ticket request error:", repr(e), flush=True)
+        return None
+
+    print("📨 Ticket status:", res.status_code, flush=True)
+
+    if res.status_code != 200:
+        print("❌ Failed to get ticket", flush=True)
+        print(res.text, flush=True)
+        return None
+
+    data = res.json()
+
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        return inner.get("ticket")
+
+    return data.get("ticket")
+
+
+# -------------------------
+# CONNECT (MODEL A: SINGLE SESSION)
+# -------------------------
 def connect():
     ticket = get_ticket()
 
     if not ticket:
         print("❌ No ticket — exiting", flush=True)
         return
+
+    print("🔌 Opening WebSocket...", flush=True)
 
     ws = websocket.WebSocketApp(
         WS_URL,
@@ -219,9 +220,15 @@ def connect():
         on_close=on_close,
     )
 
-    ws.run_forever(ping_interval=30, ping_timeout=10)
+    ws.run_forever(
+        ping_interval=30,
+        ping_timeout=10,
+    )
 
 
+# -------------------------
+# MAIN
+# -------------------------
 if __name__ == "__main__":
     print("🚀 ENTERING MAIN LOOP", flush=True)
     connect()
