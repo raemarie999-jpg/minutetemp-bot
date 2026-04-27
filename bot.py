@@ -46,13 +46,33 @@ def handle_message(msg):
     if msg_type == "subscribed":
         print("✅ SUBSCRIBED", msg.get("accepted"), flush=True)
 
-    elif msg_type == "observation":
-        print(
-            f"\n🌡 OBSERVATION {msg.get('slug')} | "
-            f"{msg.get('station_id')} | "
-            f"{msg.get('temperature_f')}°F",
-            flush=True,
-        )
+elif msg_type == "observation":
+    temp_f = msg.get("temperature_f")
+
+    # fallback safety (API sometimes sends different shapes or nulls)
+    if temp_f is None:
+        temp_f = msg.get("temp_f")
+    if temp_f is None:
+        temp_f = msg.get("value")
+
+    try:
+        temp_str = f"{float(temp_f):.1f}°F"
+    except (TypeError, ValueError):
+        temp_str = "N/A"
+
+    print(
+        f"\n🌡 OBSERVATION {msg.get('slug')} | "
+        f"{msg.get('station_id')} | "
+        f"{temp_str}",
+        flush=True,
+    )
+
+    engine.process_event({
+        "type": "observation",
+        "city": msg.get("slug"),
+        "station_id": msg.get("station_id"),
+        "value": temp_f,
+    })
         engine.process_event({
             "type": "observation",
             "city": msg.get("slug"),
