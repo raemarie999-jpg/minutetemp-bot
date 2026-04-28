@@ -6,7 +6,7 @@ from statistics import mean, pstdev
 class ModelEngineV3:
     def __init__(self):
         self.errors = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
-        self.history = defaultdict(list)
+        self.report_counter = defaultdict(int)
         self.leaderboard = {}
 
     # -------------------------
@@ -16,10 +16,9 @@ class ModelEngineV3:
         city = msg.get("slug")
         val = msg.get("temperature_f")
 
-        if val is None:
-            return
-
         try:
+            if val is None:
+                return
             val = float(val)
         except:
             return
@@ -30,13 +29,14 @@ class ModelEngineV3:
     # FORECAST
     # -------------------------
     def process_forecast(self, msg):
-        print(f"📊 forecast update {msg.get('slug')}", flush=True)
+        print(f"📊 forecast {msg.get('slug')}", flush=True)
 
     # -------------------------
-    # ORACLE SCORES (CORE)
+    # ORACLE SCORES
     # -------------------------
     def process_oracle_scores(self, msg):
         city = msg.get("slug")
+
         scores = (
             msg.get("overall", {}).get("scores", [])
             or msg.get("day_ahead", {}).get("scores", [])
@@ -46,14 +46,9 @@ class ModelEngineV3:
         if not city or not scores:
             return
 
-        snapshot = []
-
         for s in scores:
             model = s.get("model_id")
             mae = s.get("combined_mae")
-
-            if model is None or mae is None:
-                continue
 
             try:
                 mae = float(mae)
@@ -61,110 +56,72 @@ class ModelEngineV3:
                 continue
 
             self.errors[city][model].append(mae)
-            snapshot.append((model, mae))
 
-        if snapshot:
-            self.history[city].append(snapshot)
+        self.report_counter[city] += 1
 
-        self.update_dashboard(city)
+        if self.report_counter[city] % 5 == 0:
+            self.generate_report(city)
 
     # -------------------------
-    # WEATHER EVENT (FIXED)
+    # WEATHER
     # -------------------------
     def process_weather_event(self, msg):
-        summary = msg.get("summary") or msg.get("type")
-        print(f"⚠️ weather: {summary}", flush=True)
+        print("⚠️ weather:", msg.get("summary"), flush=True)
 
     # -------------------------
-    # SAFE DASHBOARD UPDATE
+    # SAFE REPORT GENERATION
     # -------------------------
-    def update_dashboard(self, city):
-        model_stats = {}
+    def generate_report(self, city):
+        models = self.errors[city]
 
-        for model, vals in self.errors[city].items():
+        stats = []
+
+        for m, vals in models.items():
             if len(vals) < 3:
                 continue
 
             arr = list(vals)
 
-            avg = mean(arr)
-            vol = pstdev(arr) if len(arr) > 1 else 0.0
+            mae = mean(arr)
+            vol = pstdev(arr) if len(arr) > 1 else 0
+            trend = arr[-1] - arr[0]
 
-            mid = len(arr) // 2
-            trend = (
-                mean(arr[mid:]) - mean(arr[:mid])
-                if len(arr) > 4 else 0
-            )
+            stats.append((m, mae, vol, trend))
 
-            model_stats[model] = {
-                "mae": avg,
-                "vol": vol,
-                "trend": trend,
-            }
-
-        if not model_stats:
-            print(f"⚠️ {city}: waiting for enough data...", flush=True)
+        if not stats:
+            print(f"⚠️ {city}: warming up...", flush=True)
             return
 
-        ranked = sorted(model_stats.items(), key=lambda x: x[1]["mae"])
-        self.leaderboard[city] = ranked[:5]
+        stats.sort(key=lambda x: x[1])
 
-        self.print_dashboard(city, model_stats)
+        best = stats[0]
+        worst = stats[-1]
 
-    # -------------------------
-    # DASHBOARD (CRASH-PROOF)
-    # -------------------------
-    def print_dashboard(self, city, stats):
-        print("\n" + "=" * 60)
-        print(f"🏙 CITY DASHBOARD: {city}")
-        print("=" * 60)
+        vol_avg = mean([s[2] for s in stats])
 
-        top = self.leaderboard.get(city, [])
-
-        if not top:
-            print("⚠️ no ranked models yet")
-            return
-
-        best_model = top[0][0]
-
-        stable_model = min(stats.items(), key=lambda x: x[1]["vol"])[0]
-
-        improving = min(
-            stats.items(),
-            key=lambda x: x[1]["trend"],
-        )[0] if stats else None
-
-        avg_vol = (
-            sum(v["vol"] for v in stats.values()) / len(stats)
-            if stats else 0
+        state = (
+            "STABLE" if vol_avg < 0.2
+            else "MODERATE" if vol_avg < 0.5
+            else "UNSTABLE"
         )
 
-        print(f"\n🏆 Best Model: {best_model}")
-        print(f"🧊 Most Stable: {stable_model}")
-        print(f"📈 Improving: {improving}")
-        print(f"⚠️ Volatility: {avg_vol:.3f}")
+        print("\n" + "=" * 60)
+        print(f"📊 CITY REPORT: {city}")
+        print("=" * 60)
 
-        print("\n📊 Top Models:")
-        for i, (m, s) in enumerate(top, 1):
-            print(
-                f"{i}. {m} | MAE={s['mae']:.3f} "
-                f"| VOL={s['vol']:.3f} "
-                f"| TREND={s['trend']:.3f}"
-            )
+        print(f"🏆 Best: {best[0]} | MAE {best[1]:.2f}")
+        print(f"⚠️ Worst: {worst[0]} | MAE {worst[1]:.2f}")
+        print(f"🧠 State: {state}")
+        print(f"📉 Volatility: {vol_avg:.3f}")
 
-        print("\n🧠 CONCLUSION:")
-
-        if avg_vol < 0.2:
-            print("✔ Stable forecasting environment")
-        elif avg_vol < 0.5:
-            print("⚠ Moderate volatility")
-        else:
-            print("🚨 High volatility")
+        print("\n📈 Top Models:")
+        for m in stats[:5]:
+            print(f"- {m[0]} | MAE={m[1]:.2f} | VOL={m[2]:.2f}")
 
         print("=" * 60)
 
     # -------------------------
-    # SAFE HOOK (CRITICAL)
+    # SAFE HOOK
     # -------------------------
     def tick(self):
         pass
