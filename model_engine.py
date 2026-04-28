@@ -16,8 +16,8 @@ class ModelEngine:
             "weather_events": []
         })
 
-        # ✅ unified timing control (no more broken state)
-        self.last_reports = {}
+        # report throttle tracking
+        self.last_report = defaultdict(lambda: 0)
 
     # -------------------------
     # OBSERVATIONS
@@ -35,7 +35,6 @@ class ModelEngine:
             return
 
         data = self.cities[city]
-
         data["temps"].append(temp)
         data["temps"] = data["temps"][-50:]
 
@@ -46,12 +45,10 @@ class ModelEngine:
     # -------------------------
     def process_forecast(self, msg):
         city = msg.get("slug")
-        forecasts = msg.get("forecasts", [])
-
         if not city:
             return
 
-        for f in forecasts:
+        for f in msg.get("forecasts", []):
             model = f.get("model")
             temp = f.get("temp_f")
 
@@ -95,23 +92,21 @@ class ModelEngine:
             data["weather_events"] = data["weather_events"][-20:]
 
     # -------------------------
-    # VALIDATION
+    # FORECAST VALIDATION
     # -------------------------
     def validate_forecasts(self, city, actual):
         forecasts = self.cities[city]["forecasts"]
 
         for model, pred in forecasts.items():
-            error = abs(pred - actual)
-            errs = self.cities[city]["errors"][model]
-            errs.append(error)
-            self.cities[city]["errors"][model] = errs[-20:]
+            err = abs(pred - actual)
+            self.cities[city]["errors"][model].append(err)
+            self.cities[city]["errors"][model] = self.cities[city]["errors"][model][-20:]
 
     # -------------------------
     # SCORING
     # -------------------------
     def compute_score(self, city, model):
         data = self.cities[city]
-
         scores = data["scores"]
         errors = data["errors"]
 
@@ -127,13 +122,13 @@ class ModelEngine:
         return base - penalty
 
     # -------------------------
-    # REGIME
+    # REGIME DETECTION
     # -------------------------
     def detect_regime(self, city):
         temps = self.cities[city]["temps"]
         events = self.cities[city]["weather_events"]
 
-        if len(temps) < 5:
+        if len(temps) < 3:
             return "INSUFFICIENT"
 
         if len(events) > 5:
@@ -149,7 +144,7 @@ class ModelEngine:
             return "VOLATILE"
 
     # -------------------------
-    # SIGNAL
+    # SIGNAL GENERATION
     # -------------------------
     def generate_signal(self, ranked):
         if not ranked:
@@ -165,7 +160,7 @@ class ModelEngine:
             return "NO TRADE", "LOW"
 
     # -------------------------
-    # REPORT
+    # REPORT ENGINE (FIXED)
     # -------------------------
     def generate_report(self, city):
         data = self.cities[city]
@@ -173,26 +168,24 @@ class ModelEngine:
         temps = data["temps"]
         latest = round(temps[-1], 1) if temps else "N/A"
 
-        all_models = set()
+        models = set()
         for block in data["scores"].values():
-            all_models.update(block.keys())
+            models.update(block.keys())
 
-        ranked = []
-        for m in all_models:
-            ranked.append((m, self.compute_score(city, m)))
-
+        ranked = [(m, self.compute_score(city, m)) for m in models]
         ranked.sort(key=lambda x: x[1], reverse=True)
 
         regime = self.detect_regime(city)
         signal, confidence = self.generate_signal(ranked)
 
         lines = []
-        lines.append("============================================================")
+        lines.append("=" * 60)
         lines.append(f"🏙 CITY INTELLIGENCE: {city.upper()}")
-        lines.append("------------------------------------------------------------")
+        lines.append("-" * 60)
         lines.append(f"🌡 Temps: {len(temps)} latest={latest}")
         lines.append(f"🌪 Regime: {regime}")
         lines.append(f"📊 Signal: {signal} ({confidence})")
+        lines.append("")
         lines.append("🏆 TOP MODELS:")
 
         if ranked:
@@ -201,45 +194,28 @@ class ModelEngine:
         else:
             lines.append("No model data yet")
 
-        lines.append("============================================================")
+        lines.append("=" * 60)
 
         return "\n".join(lines)
 
     # -------------------------
-    # REPORT LOOP
+    # REPORT LOOP (THIS IS THE KEY FIX)
     # -------------------------
     def maybe_report(self):
         now = time.time()
 
         for city, data in self.cities.items():
 
-            if city not in self.last_reports:
-                self.last_reports[city] = 0
-
             temps = data["temps"]
-            scores = data["scores"]
 
-            has_scores = any(len(v) > 0 for v in scores.values())
-            has_temps = len(temps) >= 3
-
-            # warming phase
-            if not has_scores or not has_temps:
-                if now - self.last_reports[city] > 60:
-                    print(f"⚠️ {city.upper()}: warming up (waiting for scores)", flush=True)
-                    self.last_reports[city] = now
+            # 🚨 ONLY REQUIRE TEMPS (NOT SCORES)
+            if len(temps) < 3:
+                if now - self.last_report[city] > 60:
+                    print(f"⚠️ {city.upper()}: warming up (collecting data...)", flush=True)
+                    self.last_report[city] = now
                 continue
 
-            # report phase
-            if now - self.last_reports[city] > 60:
-                report = self.generate_report(city)
-
-                print(report, flush=True)
-
-                # optional telegram
-                if hasattr(self, "send_telegram"):
-                    try:
-                        self.send_telegram(report)
-                    except:
-                        pass
-
-                self.last_reports[city] = now
+            # report every 60s
+            if now - self.last_report[city] > 60:
+                print(self.generate_report(city), flush=True)
+                self.last_report[city] = now
