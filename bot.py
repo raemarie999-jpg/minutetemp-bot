@@ -3,26 +3,25 @@ import os
 import requests
 import websocket
 
-from model_engine import ModelEngineV3 as ModelEngine
+from model_engine import ModelEngine
 
 API_KEY = os.getenv("MINUTETEMP_API_KEY")
 TICKET_URL = "https://api.minutetemp.com/api/v1/ws-ticket"
 WS_URL = "wss://api.minutetemp.com/ws/api/1m"
 
-CITIES = [c.strip() for c in os.getenv("CITIES", "nyc,chi,dal").split(",")]
+CITIES = [c.strip() for c in os.getenv("CITIES", "nyc").split(",")]
 
 engine = ModelEngine()
 
 
 def handle_message(msg):
     msg_type = msg.get("type")
-
     print("📥 MSG:", msg_type, flush=True)
 
     if msg_type == "observation":
         engine.process_observation(msg)
 
-    elif msg_type in ("forecast_updated", "forecast_versions"):
+    elif msg_type in ["forecast_updated", "forecast_versions"]:
         engine.process_forecast(msg)
 
     elif msg_type == "oracle_scores_updated":
@@ -35,10 +34,7 @@ def handle_message(msg):
         print("📦 snapshot complete", flush=True)
 
     elif msg_type == "subscribed":
-        print("✅ subscribed", msg.get("accepted", {}), flush=True)
-
-    elif msg_type == "price_update":
-        return
+        print("✅ subscribed", msg.get("accepted"), flush=True)
 
     else:
         print("📩 UNKNOWN:", msg_type, flush=True)
@@ -65,8 +61,8 @@ def on_open(ws):
 
 
 def get_ticket():
-    r = requests.post(TICKET_URL, headers={"X-API-Key": API_KEY})
-    return r.json()["data"]["ticket"]
+    res = requests.post(TICKET_URL, headers={"X-API-Key": API_KEY})
+    return res.json().get("data", {}).get("ticket")
 
 
 def connect():
