@@ -3,46 +3,46 @@ import os
 import requests
 import websocket
 
-from model_engine import ModelEngine
-
+from model_engine import ModelEngineV3
 
 API_KEY = os.getenv("MINUTETEMP_API_KEY")
 TICKET_URL = "https://api.minutetemp.com/api/v1/ws-ticket"
 WS_URL = "wss://api.minutetemp.com/ws/api/1m"
 
-CITIES = [c.strip() for c in os.getenv("CITIES", "nyc").split(",")]
+CITIES = [c.strip() for c in os.getenv("CITIES", "nyc,chi,dal").split(",")]
 
-engine = ModelEngine()
+engine = ModelEngineV3()
 
 
 def handle_message(msg):
     msg_type = msg.get("type")
+
     print("📥 MSG:", msg_type, flush=True)
 
-    try:
-        if msg_type == "observation":
-            engine.process_observation(msg)
+    if msg_type == "observation":
+        engine.process_observation(msg)
 
-        elif msg_type in ["forecast_updated", "forecast_versions"]:
-            engine.process_forecast(msg)
+    elif msg_type in ("forecast_updated", "forecast_versions"):
+        engine.process_forecast(msg)
 
-        elif msg_type == "oracle_scores_updated":
-            engine.process_scores(msg)
+    elif msg_type == "oracle_scores_updated":
+        engine.process_scores(msg)
 
-        elif msg_type == "weather_event":
-            engine.process_weather_event(msg)
+    elif msg_type == "weather_event":
+        engine.process_weather_event(msg)
 
-        elif msg_type == "snapshot_complete":
-            print("📦 snapshot complete", flush=True)
+    elif msg_type == "snapshot_complete":
+        print("📦 snapshot complete", flush=True)
 
-        elif msg_type == "subscribed":
-            print("✅ subscribed", msg.get("accepted"), flush=True)
+    elif msg_type == "subscribed":
+        print("✅ subscribed:", msg.get("accepted", {}), flush=True)
 
-        else:
-            print("📩 UNKNOWN:", msg_type, flush=True)
+    elif msg_type == "price_update":
+        # intentionally ignored cleanly
+        return
 
-    except Exception as e:
-        print("❌ handler error:", repr(e), flush=True)
+    else:
+        print("📩 UNKNOWN:", msg_type, flush=True)
 
     engine.maybe_report()
 
@@ -67,7 +67,7 @@ def on_open(ws):
 
 def get_ticket():
     res = requests.post(TICKET_URL, headers={"X-API-Key": API_KEY})
-    return res.json().get("data", {}).get("ticket")
+    return res.json()["data"]["ticket"]
 
 
 def connect():
