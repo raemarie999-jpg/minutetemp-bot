@@ -17,9 +17,14 @@ class ModelEngine:
             "last_report": 0
         })
 
+        # ✅ NEW: stores last generated report per city
+        self.last_reports = {}
+
     # -------------------------
-    # OBSERVATIONS
+    # OBSERVATION / FORECAST / SCORES / EVENTS
+    # (UNCHANGED — keep exactly as you have working)
     # -------------------------
+
     def process_observation(self, msg):
         city = msg.get("slug")
         temp = msg.get("temperature_f")
@@ -38,9 +43,6 @@ class ModelEngine:
 
         self._update_errors(city, temp)
 
-    # -------------------------
-    # FORECASTS
-    # -------------------------
     def process_forecast(self, msg):
         city = msg.get("slug")
         forecasts = msg.get("forecasts", [])
@@ -62,9 +64,6 @@ class ModelEngine:
             except:
                 continue
 
-    # -------------------------
-    # SCORES
-    # -------------------------
     def process_scores(self, msg):
         city = msg.get("slug")
         if not city:
@@ -90,9 +89,6 @@ class ModelEngine:
         data["scores"]["day_ahead"] = safe(msg.get("day_ahead", {}).get("scores", []))
         data["scores"]["day_of"] = safe(msg.get("day_of", {}).get("scores", []))
 
-    # -------------------------
-    # WEATHER EVENTS
-    # -------------------------
     def process_weather_event(self, msg):
         city = msg.get("slug")
         summary = msg.get("summary", "")
@@ -104,9 +100,6 @@ class ModelEngine:
         data["weather_events"].append(summary)
         data["weather_events"] = data["weather_events"][-30:]
 
-    # -------------------------
-    # ERROR TRACKING
-    # -------------------------
     def _update_errors(self, city, actual):
         data = self.cities[city]
 
@@ -216,10 +209,15 @@ class ModelEngine:
 
         lines.append("=" * 60)
 
-        return "\n".join(lines)
+        report = "\n".join(lines)
+
+        # ✅ store last report (for bot forwarding)
+        self.last_reports[city] = report
+
+        return report
 
     # -------------------------
-    # REPORT LOOP (THIS IS WHAT YOU WERE MISSING)
+    # REPORT LOOP (UNCHANGED LOGIC)
     # -------------------------
     def maybe_report(self):
         now = time.time()
@@ -228,5 +226,8 @@ class ModelEngine:
             if now - data["last_report"] < 60:
                 continue
 
-            print(self.generate_report(city), flush=True)
+            report = self.generate_report(city)
+            print(report, flush=True)
+
+            self.last_reports[city] = report
             data["last_report"] = now
