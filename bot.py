@@ -9,27 +9,23 @@ API_KEY = os.getenv("MINUTETEMP_API_KEY")
 TICKET_URL = "https://api.minutetemp.com/api/v1/ws-ticket"
 WS_URL = "wss://api.minutetemp.com/ws/api/1m"
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 CITIES = [c.strip() for c in os.getenv("CITIES", "nyc").split(",")]
 
 engine = ModelEngine()
 
-# ✅ TELEGRAM CONFIG
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 
 def send_telegram(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=5
-        )
-    except Exception as e:
-        print("⚠️ Telegram error:", repr(e), flush=True)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text
+    })
 
 
 def handle_message(msg):
@@ -52,10 +48,6 @@ def handle_message(msg):
 
     engine.maybe_report()
 
-    # ✅ SEND LATEST REPORTS (SAFE + CONTROLLED)
-    for city in engine.last_reports:
-        send_telegram(engine.last_reports[city])
-
 
 def on_message(ws, message):
     try:
@@ -66,10 +58,11 @@ def on_message(ws, message):
 
 def on_open(ws):
     print("🔌 connected", flush=True)
-
     for city in CITIES:
-        ws.send(json.dumps({"type": "subscribe", "cities": [city]}))
-        print(f"📡 subscribed: {city}", flush=True)
+        ws.send(json.dumps({
+            "type": "subscribe",
+            "cities": [city]
+        }))
 
 
 def get_ticket():
