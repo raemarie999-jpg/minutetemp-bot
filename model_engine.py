@@ -1,181 +1,145 @@
 import time
-import numpy as np
-from collections import defaultdict, deque
-from statistics import mean, pstdev
+from collections import defaultdict
 
-
-class ModelEngineV4:
+class ModelEngine:
     def __init__(self):
-        # -------------------------
-        # MODEL PERFORMANCE STORAGE
-        # -------------------------
-        self.errors = defaultdict(lambda: defaultdict(lambda: deque(maxlen=300)))
+        self.cities = defaultdict(lambda: {
+            "temps": [],
+            "forecasts": [],
+            "scores": {
+                "overall": {},
+                "day_ahead": {},
+                "day_of": {}
+            },
+            "last_report": 0
+        })
 
-        # -------------------------
-        # DASHBOARD STATE
-        # -------------------------
-        self.last_dashboard_time = defaultdict(float)
-        self.dashboard_interval = 60  # seconds
-
-        self.last_best_model = {}
-
-    # =========================================================
+    # -------------------------
     # OBSERVATIONS
-    # =========================================================
+    # -------------------------
     def process_observation(self, msg):
         city = msg.get("slug")
-        val = msg.get("temperature_f")
+        temp = msg.get("temperature_f")
 
-        try:
-            if val is None:
-                return
-            val = float(val)
-        except:
-            return
+        if city and temp is not None:
+            try:
+                temp = float(temp)
+                self.cities[city]["temps"].append(temp)
+                self.cities[city]["temps"] = self.cities[city]["temps"][-20:]
+            except:
+                pass
 
-        print(f"🌡 {city}: {val}", flush=True)
-
-    # =========================================================
-    # FORECASTS (INFO ONLY)
-    # =========================================================
+    # -------------------------
+    # FORECASTS
+    # -------------------------
     def process_forecast(self, msg):
-        print(f"📊 forecast update {msg.get('slug')}", flush=True)
-
-    # =========================================================
-    # WEATHER EVENTS (CONTEXT ONLY)
-    # =========================================================
-    def process_weather_event(self, msg):
-        print(f"⚠️ weather event: {msg.get('summary')}", flush=True)
-
-    # =========================================================
-    # ORACLE SCORES (CORE INPUT)
-    # =========================================================
-    def process_oracle_scores(self, msg):
         city = msg.get("slug")
+        data = msg.get("forecasts", [])
+
+        if city and data:
+            self.cities[city]["forecasts"] = data
+
+    # -------------------------
+    # ORACLE SCORES
+    # -------------------------
+    def process_scores(self, msg):
+        city = msg.get("slug")
+
         if not city:
             return
 
-        scores = (
-            msg.get("overall", {}).get("scores", [])
-            or msg.get("day_ahead", {}).get("scores", [])
-            or msg.get("scores", [])
-        )
+        overall = msg.get("overall", {}).get("scores", [])
+        day_ahead = msg.get("day_ahead", {}).get("scores", [])
+        day_of = msg.get("day_of", {}).get("scores", [])
 
-        if not scores:
-            return
+        def parse(scores):
+            return {
+                s.get("model"): s.get("score")
+                for s in scores
+                if s.get("model") and s.get("score") is not None
+            }
 
-        for s in scores:
-            model = s.get("model_id")
-            mae = s.get("combined_mae")
+        self.cities[city]["scores"]["overall"] = parse(overall)
+        self.cities[city]["scores"]["day_ahead"] = parse(day_ahead)
+        self.cities[city]["scores"]["day_of"] = parse(day_of)
 
-            try:
-                mae = float(mae)
-            except:
-                continue
+    # -------------------------
+    # WEATHER EVENTS (SAFE NO-OP)
+    # -------------------------
+    def process_weather_event(self, msg):
+        pass
 
-            self.errors[city][model].append(mae)
+    # -------------------------
+    # MAIN REPORT ENGINE
+    # -------------------------
+    def generate_report(self, city):
+        data = self.cities[city]
 
-        self.update_dashboard(city)
+        scores = data["scores"]
+        temps = data["temps"]
 
-    # =========================================================
-    # DASHBOARD BUILDER
-    # =========================================================
-    def build_dashboard(self, city):
-        models = self.errors[city]
+        combined = defaultdict(list)
 
-        stats = []
+        # merge all score types
+        for mode in ["overall", "day_ahead", "day_of"]:
+            for model, score in scores[mode].items():
+                combined[model].append(score)
 
-        for model, vals in models.items():
-            if len(vals) < 5:
-                continue
+        if not combined:
+            return f"⚠️ {city}: no model data yet"
 
-            arr = list(vals)
+        # average score per model
+        ranked = []
+        for model, vals in combined.items():
+            avg = sum(vals) / len(vals)
+            ranked.append((model, avg))
 
-            mae = mean(arr)
-            vol = pstdev(arr) if len(arr) > 1 else 0.0
-            trend = arr[-1] - arr[0] if len(arr) > 1 else 0.0
+        ranked.sort(key=lambda x: x[1], reverse=True)
 
-            score = mae + (0.5 * vol) + (0.2 * abs(trend))
+        top5 = ranked[:5]
+        best_model = top5[0][0]
 
-            stats.append({
-                "model": model,
-                "mae": mae,
-                "vol": vol,
-                "trend": trend,
-                "score": score
-            })
+        # confidence
+        confidence = "LOW"
+        if len(ranked) >= 5:
+            confidence = "MEDIUM"
+        if len(ranked) >= 10:
+            confidence = "HIGH"
 
-        if not stats:
-            return None
+        # trend (basic)
+        trend = "STABLE"
+        if len(temps) >= 5:
+            if temps[-1] > temps[0]:
+                trend = "WARMING"
+            elif temps[-1] < temps[0]:
+                trend = "COOLING"
 
-        stats.sort(key=lambda x: x["score"])
+        # build output
+        lines = []
+        lines.append("============================================================")
+        lines.append(f"🏙 CITY REPORT: {city.upper()}")
+        lines.append("------------------------------------------------------------")
+        lines.append(f"🌡 Trend: {trend}")
+        lines.append(f"📊 Confidence: {confidence}")
+        lines.append("")
+        lines.append("🏆 Top Models:")
 
-        best = stats[0]
+        for i, (model, score) in enumerate(top5, 1):
+            lines.append(f"{i}. {model} → {round(score, 3)}")
 
-        avg_vol = mean([s["vol"] for s in stats])
+        lines.append("")
+        lines.append(f"✅ BEST MODEL RIGHT NOW: {best_model}")
+        lines.append("============================================================")
 
-        if avg_vol < 0.2:
-            state = "STABLE"
-        elif avg_vol < 0.5:
-            state = "MODERATE"
-        else:
-            state = "UNSTABLE"
+        return "\n".join(lines)
 
-        confidence = 1 / (1 + best["score"])
-
-        return {
-            "city": city,
-            "best": best["model"],
-            "confidence": confidence,
-            "state": state,
-            "top_models": stats[:5]
-        }
-
-    # =========================================================
-    # DASHBOARD OUTPUT (FINAL USER VIEW)
-    # =========================================================
-    def render_dashboard(self, city):
-        dash = self.build_dashboard(city)
-
-        if not dash:
-            print(f"⚠️ {city}: warming up (insufficient data)", flush=True)
-            return
-
-        prev = self.last_best_model.get(city)
-
-        self.last_best_model[city] = dash["best"]
-
-        print("\n" + "=" * 70)
-        print(f"🏙 LIVE MODEL DASHBOARD: {city}")
-        print("=" * 70)
-
-        print(f"🏆 Best Model: {dash['best']}")
-        print(f"🎯 Confidence: {dash['confidence']:.2f}")
-        print(f"🧠 State: {dash['state']}")
-
-        if prev and prev != dash["best"]:
-            print(f"🔁 MODEL SWITCH: {prev} → {dash['best']}")
-
-        print("\n📊 TOP 5 MODELS")
-
-        for m in dash["top_models"]:
-            print(
-                f"- {m['model']} | "
-                f"MAE={m['mae']:.2f} | "
-                f"VOL={m['vol']:.2f} | "
-                f"TREND={m['trend']:.2f}"
-            )
-
-        print("=" * 70)
-
-    # =========================================================
-    # DASHBOARD UPDATE TRIGGER (SAFE + STABLE)
-    # =========================================================
-    def update_dashboard(self, city):
+    # -------------------------
+    # AUTO REPORT LOOP
+    # -------------------------
+    def maybe_report(self):
         now = time.time()
 
-        if now - self.last_dashboard_time[city] < self.dashboard_interval:
-            return
-
-        self.last_dashboard_time[city] = now
-        self.render_dashboard(city)
+        for city in self.cities:
+            if now - self.cities[city]["last_report"] > 60:
+                print(self.generate_report(city), flush=True)
+                self.cities[city]["last_report"] = now
