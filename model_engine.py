@@ -4,10 +4,11 @@ from collections import defaultdict, deque
 
 class ModelEngineV3:
     """
-    Tiered live intelligence engine:
-    - Tier 1: cold start (temps only)
-    - Tier 2: emerging intelligence (temps + forecasts/events)
-    - Tier 3: full ranking (oracle scores)
+    Stable intelligence engine:
+    - collects observations
+    - tracks forecast errors
+    - ranks models
+    - emits reports every 60s per city
     """
 
     def __init__(self):
@@ -19,13 +20,13 @@ class ModelEngineV3:
                 "day_ahead": {},
                 "day_of": {}
             },
-            "errors": defaultdict(lambda: deque(maxlen=30)),
-            "weather_events": deque(maxlen=30),
+            "errors": defaultdict(lambda: deque(maxlen=50)),
+            "weather_events": deque(maxlen=50),
             "last_report": 0
         })
 
     # -------------------------
-    # OBSERVATIONS
+    # OBSERVATION
     # -------------------------
     def process_observation(self, msg):
         city = msg.get("slug")
@@ -40,8 +41,6 @@ class ModelEngineV3:
             return
 
         self.cities[city]["temps"].append(temp)
-
-        # validate forecasts when new truth arrives
         self.validate_forecasts(city, temp)
 
     # -------------------------
@@ -67,7 +66,7 @@ class ModelEngineV3:
                 continue
 
     # -------------------------
-    # ORACLE SCORES
+    # SCORES
     # -------------------------
     def process_scores(self, msg):
         city = msg.get("slug")
@@ -98,15 +97,15 @@ class ModelEngineV3:
             self.cities[city]["weather_events"].append(summary)
 
     # -------------------------
-    # FORECAST VALIDATION
+    # VALIDATION
     # -------------------------
     def validate_forecasts(self, city, actual):
         forecasts = self.cities[city]["forecasts"]
 
         for model, pred in forecasts.items():
             try:
-                error = abs(pred - actual)
-                self.cities[city]["errors"][model].append(error)
+                err = abs(float(pred) - float(actual))
+                self.cities[city]["errors"][model].append(err)
             except:
                 continue
 
@@ -114,32 +113,32 @@ class ModelEngineV3:
     # SCORING
     # -------------------------
     def compute_score(self, city, model):
-        scores = self.cities[city]["scores"]
-        errors = self.cities[city]["errors"]
+        s = self.cities[city]["scores"]
+        e = self.cities[city]["errors"]
 
-        overall = scores["overall"].get(model, 0)
-        day_ahead = scores["day_ahead"].get(model, 0)
-        day_of = scores["day_of"].get(model, 0)
+        base = (
+            s["overall"].get(model, 0) * 0.2 +
+            s["day_ahead"].get(model, 0) * 0.3 +
+            s["day_of"].get(model, 0) * 0.5
+        )
 
-        base = (day_of * 0.5) + (day_ahead * 0.3) + (overall * 0.2)
-
-        err_list = errors.get(model, [])
-        penalty = (sum(err_list) / len(err_list)) * 0.05 if err_list else 0
+        err = e.get(model, [])
+        penalty = (sum(err) / len(err)) * 0.05 if err else 0
 
         return base - penalty
 
     # -------------------------
-    # REGIME DETECTION
+    # REGIME
     # -------------------------
     def detect_regime(self, city):
         temps = list(self.cities[city]["temps"])
         events = self.cities[city]["weather_events"]
 
         if len(events) >= 5:
-            return "STORM-RISK"
+            return "STORM"
 
         if len(temps) < 3:
-            return "COLD-START"
+            return "COLD_START"
 
         delta = temps[-1] - temps[0]
 
@@ -151,53 +150,33 @@ class ModelEngineV3:
             return "VOLATILE"
 
     # -------------------------
-    # SIGNAL ENGINE
+    # SIGNAL
     # -------------------------
     def generate_signal(self, ranked):
         if not ranked:
-            return "NO TRADE", "LOW"
+            return "NO SIGNAL", "LOW"
 
         best, score = ranked[0]
 
         if len(ranked) >= 5 and score > 0.7:
-            return f"STRONG SIGNAL: {best}", "HIGH"
+            return f"STRONG: {best}", "HIGH"
         elif len(ranked) >= 3:
-            return f"WEAK SIGNAL: {best}", "MEDIUM"
-
-        return "NO TRADE", "LOW"
+            return f"WEAK: {best}", "MEDIUM"
+        else:
+            return "NO SIGNAL", "LOW"
 
     # -------------------------
-    # REPORT TIERS
+    # REPORT
     # -------------------------
-    def tier1(self, city):
-        temps = list(self.cities[city]["temps"])
-
-        return "\n".join([
-            "🟢 COLD START INTELLIGENCE",
-            f"City: {city.upper()}",
-            f"Temp: {temps[-1] if temps else 'N/A'}",
-            f"Data points: {len(temps)}",
-            "Status: collecting baseline signals"
-        ])
-
-    def tier2(self, city):
-        temps = list(self.cities[city]["temps"])
-        regime = self.detect_regime(city)
-
-        return "\n".join([
-            "🟡 EMERGING INTELLIGENCE",
-            f"City: {city.upper()}",
-            f"Temp: {temps[-1] if temps else 'N/A'}",
-            f"Regime: {regime}",
-            f"Weather events: {len(self.cities[city]['weather_events'])}"
-        ])
-
-    def tier3(self, city):
+    def generate_report(self, city):
         data = self.cities[city]
 
         models = set()
-        for d in data["scores"].values():
-            models.update(d.keys())
+        for block in data["scores"].values():
+            models.update(block.keys())
+
+        if not models:
+            return f"⚠️ {city}: collecting model data..."
 
         ranked = [(m, self.compute_score(city, m)) for m in models]
         ranked.sort(key=lambda x: x[1], reverse=True)
@@ -205,50 +184,45 @@ class ModelEngineV3:
         regime = self.detect_regime(city)
         signal, conf = self.generate_signal(ranked)
 
-        lines = [
-            "🔴 FULL INTELLIGENCE REPORT",
-            f"City: {city.upper()}",
-            f"Regime: {regime}",
-            f"Confidence: {conf}",
-            "",
-            "🏆 MODEL LEADERBOARD"
-        ]
+        out = []
+        out.append("=" * 60)
+        out.append(f"🏙 CITY REPORT: {city.upper()}")
+        out.append(f"🌪 REGIME: {regime}")
+        out.append(f"📊 CONFIDENCE: {conf}")
+        out.append("")
+        out.append("🏆 TOP MODELS:")
 
         for i, (m, s) in enumerate(ranked[:5], 1):
-            lines.append(f"{i}. {m} → {round(s, 3)}")
+            out.append(f"{i}. {m} → {round(s, 3)}")
 
-        lines += ["", f"🎯 SIGNAL: {signal}"]
+        out.append("")
+        out.append(f"🎯 SIGNAL: {signal}")
+        out.append("=" * 60)
 
-        return "\n".join(lines)
-
-    # -------------------------
-    # MASTER REPORT
-    # -------------------------
-    def generate_report(self, city):
-        data = self.cities[city]
-
-        temps = len(data["temps"])
-        scores_exist = any(len(v) > 0 for v in data["scores"].values())
-
-        if scores_exist:
-            return self.tier3(city)
-
-        if temps >= 5:
-            return self.tier2(city)
-
-        if temps >= 1:
-            return self.tier1(city)
-
-        return f"⚠️ {city}: waiting for data"
+        return "\n".join(out)
 
     # -------------------------
-    # LOOP
+    # REPORT LOOP
     # -------------------------
     def maybe_report(self):
         now = time.time()
 
-        for city in self.cities:
-            data = self.cities[city]
+        for city, data in self.cities.items():
+
+            has_temps = len(data["temps"]) >= 3
+            has_scores = any(len(v) > 0 for v in data["scores"].values())
+
+            if not has_temps:
+                if now - data["last_report"] > 60:
+                    print(f"⚠️ {city}: warming up (temps only)", flush=True)
+                    data["last_report"] = now
+                continue
+
+            if not has_scores:
+                if now - data["last_report"] > 60:
+                    print(f"⚠️ {city}: warming up (waiting for scores)", flush=True)
+                    data["last_report"] = now
+                continue
 
             if now - data["last_report"] > 60:
                 print(self.generate_report(city), flush=True)
