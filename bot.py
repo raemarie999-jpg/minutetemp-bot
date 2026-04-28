@@ -38,68 +38,52 @@ engine = ModelEngineV3()
 # TICKET
 # -------------------------
 def get_ticket():
-    print("📡 Requesting ticket...", flush=True)
-
     try:
         res = requests.post(
             TICKET_URL,
             headers={"X-API-Key": API_KEY},
             timeout=10,
         )
+        data = res.json()
+        return data.get("data", {}).get("ticket") or data.get("ticket")
     except Exception as e:
         print("❌ ticket error:", repr(e), flush=True)
         return None
 
-    print("📨 Ticket status:", res.status_code, flush=True)
-
-    if res.status_code != 200:
-        print("❌ Failed ticket:", res.text, flush=True)
-        return None
-
-    data = res.json()
-    return data.get("data", {}).get("ticket") or data.get("ticket")
-
 
 # -------------------------
-# MESSAGE ROUTER (CLEAN)
+# ROUTER
 # -------------------------
 def handle_message(msg):
     t = msg.get("type")
     print("📥 MSG:", t, flush=True)
 
-    # ---------------- OBSERVATION ----------------
     if t == "observation":
         engine.process_observation(msg)
 
-    # ---------------- FORECAST ----------------
+    elif t in ("oracle_scores_updated",):
+        engine.process_oracle_scores(msg)
+
     elif t in ("forecast_versions", "forecast_updated"):
         engine.process_forecast(msg)
 
-    # ---------------- ORACLE SCORES ----------------
-    elif t == "oracle_scores_updated":
-        engine.process_oracle_scores(msg)
-
-    # ---------------- WEATHER EVENTS ----------------
     elif t == "weather_event":
         engine.process_weather_event(msg)
 
-    # ---------------- CONTROL ----------------
     elif t == "subscribed":
-        print("✅ subscribed:", msg.get("accepted"), flush=True)
+        print("✅ subscribed", msg.get("accepted"), flush=True)
 
     elif t == "snapshot_complete":
         print("📦 snapshot complete", flush=True)
 
-    # ---------------- UNKNOWN ----------------
     else:
         print("📩 UNKNOWN:", t, flush=True)
 
-    # update dashboard every message (cheap + safe)
     engine.tick()
 
 
 # -------------------------
-# WEBSOCKET
+# WS
 # -------------------------
 def on_message(ws, message):
     try:
