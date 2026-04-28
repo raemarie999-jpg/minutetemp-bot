@@ -13,10 +13,27 @@ CITIES = [c.strip() for c in os.getenv("CITIES", "nyc").split(",")]
 
 engine = ModelEngine()
 
+# ✅ TELEGRAM CONFIG
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
+def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=5
+        )
+    except Exception as e:
+        print("⚠️ Telegram error:", repr(e), flush=True)
+
 
 def handle_message(msg):
     msg_type = msg.get("type")
-    print("📥 MSG:", msg_type, flush=True)
 
     if msg_type == "observation":
         engine.process_observation(msg)
@@ -33,13 +50,11 @@ def handle_message(msg):
     elif msg_type == "snapshot_complete":
         print("📦 snapshot complete", flush=True)
 
-    elif msg_type == "subscribed":
-        print("✅ subscribed", msg.get("accepted"), flush=True)
-
-    else:
-        print("📩 UNKNOWN:", msg_type, flush=True)
-
     engine.maybe_report()
+
+    # ✅ SEND LATEST REPORTS (SAFE + CONTROLLED)
+    for city in engine.last_reports:
+        send_telegram(engine.last_reports[city])
 
 
 def on_message(ws, message):
@@ -53,10 +68,7 @@ def on_open(ws):
     print("🔌 connected", flush=True)
 
     for city in CITIES:
-        ws.send(json.dumps({
-            "type": "subscribe",
-            "cities": [city]
-        }))
+        ws.send(json.dumps({"type": "subscribe", "cities": [city]}))
         print(f"📡 subscribed: {city}", flush=True)
 
 
@@ -80,5 +92,4 @@ def connect():
 
 if __name__ == "__main__":
     print("🔥 BOT STARTING", flush=True)
-    print("🌍 CITIES:", CITIES, flush=True)
     connect()
