@@ -1,270 +1,199 @@
-import os
-import time
+import numpy as np
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-import numpy as np
-from telegram_alerts import TelegramAlerts
-
 
 def now():
-    return datetime.now(timezone.utc)
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-class ModelEngine:
+class ModelEngineV2:
+    """
+    Live forecasting decision engine:
+    - tracks model forecasts
+    - compares to observations
+    - integrates oracle scores
+    - produces ranked leaderboard per city
+    """
+
     def __init__(self):
-        # -------------------------
-        # DATA
-        # -------------------------
-        self.observations = {}
+        # city -> model -> latest forecast
         self.forecasts = defaultdict(dict)
 
-        # error tracking
-        self.errors = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
+        # city -> latest observation
+        self.observations = {}
 
-        # oracle scores by mode
+        # city -> model -> rolling forecast errors
+        self.errors = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50)))
+
+        # oracle skill store:
+        # city -> model -> {"overall": x, "day_ahead": y}
         self.oracle = defaultdict(lambda: defaultdict(dict))
-        # city -> model -> {overall, day_ahead, day_of}
-
-        # tracking
-        self.last_best = {}
-        self.last_predictive = {}
-        self.last_alert_time = {}
-
-        self.telegram = TelegramAlerts()
-
-        self.cooldown = 300
-
-        print("🧠 ModelEngine V2 initialized", flush=True)
 
     # -------------------------
-    # ENTRY
+    # EVENT ENTRY POINT
     # -------------------------
     def process_event(self, event):
-        t = event.get("type")
+        etype = event.get("type")
 
-        if t == "observation":
-            self.handle_observation(event)
+        if etype == "observation":
+            self._handle_observation(event)
 
-        elif t == "forecast":
-            self.handle_forecast(event)
+        elif etype == "forecast":
+            self._handle_forecast(event)
 
-        elif t == "oracle_scores":
-            self.handle_oracle(event)
-
-    # -------------------------
-    # OBSERVATION
-    # -------------------------
-    def handle_observation(self, event):
-        city = event.get("city")
-        val = event.get("value")
-
-        try:
-            val = float(val)
-        except:
-            return
-
-        self.observations[city] = val
-        self.validate(city, val)
+        elif etype == "oracle_scores":
+            self._handle_oracle(event)
 
     # -------------------------
-    # FORECAST
+    # OBSERVATION (TRUTH)
     # -------------------------
-    def handle_forecast(self, event):
-        city = event.get("city")
+    def _handle_observation(self, event):
+        city = event["city"]
+        value = event["value"]
+
+        self.observations[city] = float(value)
+
+        # score all forecasts against truth
+        self._update_errors(city)
+
+    # -------------------------
+    # FORECASTS (MODEL OUTPUTS)
+    # -------------------------
+    def _handle_forecast(self, event):
+        city = event["city"]
         models = event.get("models", [])
 
-        count = 0
-
         for m in models:
-            mid = m.get("model_id")
-            val = m.get("value")
+            model = m.get("model_id")
+            value = m.get("value")
 
-            if mid is None or val is None:
+            if model is None or value is None:
                 continue
 
-            try:
-                val = float(val)
-            except:
-                continue
-
-            self.forecasts[city][mid] = val
-            count += 1
-
-        if count:
-            print(f"📊 {city}: {count} forecasts", flush=True)
+            self.forecasts[city][model] = float(value)
 
     # -------------------------
-    # ORACLE
+    # ORACLE SCORES (MODEL HISTORY)
     # -------------------------
-    def handle_oracle(self, event):
-        city = event.get("city")
-        mode = event.get("mode", "overall")
+    def _handle_oracle(self, event):
+        city = event["city"]
         scores = event.get("scores", [])
 
         for s in scores:
-            mid = s.get("model_id")
-            mae = s.get("combined_mae")
-
-            if mid is None or mae is None:
+            model = s.get("model_id")
+            if not model:
                 continue
 
-            try:
-                mae = float(mae)
-            except:
-                continue
-
-            self.oracle[city][mid][mode] = mae
-
-        print(f"📈 {city}: oracle {mode} updated", flush=True)
+            self.oracle[city][model] = {
+                "overall": float(s.get("overall_mae", 1.0)),
+                "day_ahead": float(s.get("day_ahead_mae", 1.0)),
+            }
 
     # -------------------------
-    # VALIDATION
+    # ERROR UPDATE
     # -------------------------
-    def validate(self, city, actual):
-        if city not in self.forecasts:
+    def _update_errors(self, city):
+        if city not in self.observations:
             return
 
-        for mid, forecast in self.forecasts[city].items():
-            err = abs(forecast - actual)
-            self.errors[city][mid].append(err)
+        obs = self.observations[city]
 
-        self.rank(city)
+        for model, pred in self.forecasts[city].items():
+            err = abs(pred - obs)
+            self.errors[city][model].append(err)
 
     # -------------------------
-    # CORE SCORING
+    # WEIGHTED MODEL SCORE
     # -------------------------
-    def compute_score(self, city, mid):
-        errs = self.errors[city][mid]
-
-        if len(errs) < 5:
+    def _model_score(self, city, model):
+        errs = self.errors[city][model]
+        if len(errs) < 3:
             return None
 
-        arr = np.array(errs)
+        # recent performance
+        recent = np.mean(errs)
 
-        # 1. time-weighted error
-        weights = np.linspace(0.5, 1.5, len(arr))
-        weighted_error = np.average(arr, weights=weights)
+        # oracle weighting (if available)
+        oracle = self.oracle[city].get(model, {})
+        overall = oracle.get("overall", 1.0)
+        day_ahead = oracle.get("day_ahead", 1.0)
 
-        # 2. volatility penalty
-        volatility = np.std(arr)
+        oracle_weight = 0.6 * day_ahead + 0.4 * overall
 
-        # 3. trend (slope)
-        slope = np.polyfit(range(len(arr)), arr, 1)[0]
-
-        # 4. oracle blending
-        oracle_block = self.oracle[city].get(mid, {})
-        oracle_score = None
-
-        if oracle_block:
-            parts = []
-
-            if "day_of" in oracle_block:
-                parts.append(oracle_block["day_of"] * 1.2)
-
-            if "day_ahead" in oracle_block:
-                parts.append(oracle_block["day_ahead"] * 1.0)
-
-            if "overall" in oracle_block:
-                parts.append(oracle_block["overall"] * 0.6)
-
-            if parts:
-                oracle_score = np.mean(parts)
-
-        # FINAL SCORE
-        score = weighted_error
-        score += 0.6 * volatility
-        score += 0.8 * slope
-
-        if oracle_score is not None:
-            score = 0.6 * score + 0.4 * oracle_score
-
-        return score
+        return 0.7 * recent + 0.3 * oracle_weight
 
     # -------------------------
-    # RANKING
+    # TREND DETECTION
     # -------------------------
-    def rank(self, city):
+    def _trend(self, city, model):
+        errs = self.errors[city][model]
+        if len(errs) < 6:
+            return "stable"
+
+        x = np.arange(len(errs))
+        slope = np.polyfit(x, errs, 1)[0]
+
+        if slope < -0.01:
+            return "improving"
+        elif slope > 0.01:
+            return "worsening"
+        return "stable"
+
+    # -------------------------
+    # LEADERBOARD
+    # -------------------------
+    def get_leaderboard(self, city):
         scores = {}
 
-        for mid in self.forecasts[city]:
-            s = self.compute_score(city, mid)
-            if s is not None:
-                scores[mid] = s
+        for model in self.forecasts[city].keys():
+            score = self._model_score(city, model)
+            if score is None:
+                continue
 
-        if len(scores) < 2:
-            return
+            scores[model] = score
 
-        # LIVE BEST
-        live_best = min(scores, key=scores.get)
+        ranked = sorted(scores.items(), key=lambda x: x[1])
 
-        # PREDICTIVE BEST (trend-adjusted)
-        predictive_scores = {}
-
-        for mid in scores:
-            errs = self.errors[city][mid]
-            arr = np.array(errs)
-
-            slope = np.polyfit(range(len(arr)), arr, 1)[0]
-            predictive_scores[mid] = scores[mid] + slope
-
-        pred_best = min(predictive_scores, key=predictive_scores.get)
-
-        # CONFIDENCE
-        sorted_vals = sorted(scores.values())
-        gap = sorted_vals[1] - sorted_vals[0]
-
-        if gap > 1.0:
-            confidence = "HIGH"
-        elif gap > 0.4:
-            confidence = "MEDIUM"
-        else:
-            confidence = "LOW"
-
-        print(
-            f"🏆 {city.upper()} LIVE: {live_best} | "
-            f"PRED: {pred_best} | CONF: {confidence}",
-            flush=True,
-        )
-
-        self.maybe_alert(city, live_best, pred_best, confidence)
-
-        self.last_best[city] = live_best
-        self.last_predictive[city] = pred_best
+        return ranked[:5]
 
     # -------------------------
-    # ALERTS
+    # DASHBOARD OUTPUT
     # -------------------------
-    def maybe_alert(self, city, live, pred, confidence):
-        now_ts = time.time()
+    def print_dashboard(self):
+        for city in self.observations.keys():
+            print("\n" + "=" * 60)
+            print(f"🏙 CITY: {city.upper()}")
 
-        if now_ts - self.last_alert_time.get(city, 0) < self.cooldown:
-            return
+            leaderboard = self.get_leaderboard(city)
 
-        prev_live = self.last_best.get(city)
-        prev_pred = self.last_predictive.get(city)
+            if not leaderboard:
+                print("No usable model data yet.")
+                continue
 
-        if prev_live == live and prev_pred == pred:
-            return
+            print("\n🏆 MODEL LEADERBOARD (Top 5)\n")
 
-        self.last_alert_time[city] = now_ts
+            for i, (model, score) in enumerate(leaderboard, 1):
+                trend = self._trend(city, model)
 
-        msg = (
-            f"🚨 MODEL UPDATE ({city.upper()})\n"
-            f"Live: {prev_live} → {live}\n"
-            f"Predictive: {prev_pred} → {pred}\n"
-            f"Confidence: {confidence}"
-        )
+                arrow = {
+                    "improving": "📉 improving",
+                    "worsening": "📈 worsening",
+                    "stable": "➡️ stable",
+                }[trend]
 
-        print(msg, flush=True)
+                print(f"{i}. {model:<8} score={score:.3f} {arrow}")
 
-        try:
-            self.telegram.send(msg)
-        except Exception as e:
-            print("❌ Telegram error:", repr(e), flush=True)
+            best = leaderboard[0][1]
+            second = leaderboard[1][1] if len(leaderboard) > 1 else best
 
-    # -------------------------
-    # DAILY SUMMARY
-    # -------------------------
-    def maybe_send_daily_summary(self):
-        pass
+            spread = second - best
+
+            if spread < 0.2:
+                conf = "LOW CONFIDENCE ⚠️"
+            elif spread < 0.5:
+                conf = "MEDIUM CONFIDENCE"
+            else:
+                conf = "HIGH CONFIDENCE ✅"
+
+            print("\n⚖️", conf)
