@@ -211,6 +211,7 @@ class ModelEngine:
                 continue
 
             # ALWAYS report every 60s once data exists
+            print(f"🧠 REPORT CHECK: {city} temps={len(temps)} scores={len(data['scores']['overall'])}", flush=True)
             if now - data["last_report"] > 60:
                 print(self.generate_report(city), flush=True)
                 data["last_report"] = now
