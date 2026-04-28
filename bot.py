@@ -4,7 +4,7 @@ import sys
 import requests
 import websocket
 
-from model_engine import ModelEngineV2
+from model_engine import ModelEngineV3
 
 API_KEY = os.getenv("MINUTETEMP_API_KEY")
 
@@ -28,67 +28,78 @@ print("🔥 BOT STARTING", flush=True)
 print("🌍 CITIES:", CITIES, flush=True)
 
 if not API_KEY:
-    print("❌ missing API key", flush=True)
+    print("❌ Missing API key", flush=True)
     sys.exit(1)
 
-engine = ModelEngineV2()
+engine = ModelEngineV3()
 
 
 # -------------------------
-# SAFE TICKET
+# TICKET
 # -------------------------
 def get_ticket():
+    print("📡 Requesting ticket...", flush=True)
+
     try:
-        r = requests.post(
+        res = requests.post(
             TICKET_URL,
             headers={"X-API-Key": API_KEY},
             timeout=10,
         )
-        if r.status_code != 200:
-            print("❌ ticket error:", r.text, flush=True)
-            return None
-
-        data = r.json()
-        return data.get("data", {}).get("ticket") or data.get("ticket")
-
     except Exception as e:
-        print("❌ ticket exception:", repr(e), flush=True)
+        print("❌ ticket error:", repr(e), flush=True)
         return None
+
+    print("📨 Ticket status:", res.status_code, flush=True)
+
+    if res.status_code != 200:
+        print("❌ Failed ticket:", res.text, flush=True)
+        return None
+
+    data = res.json()
+    return data.get("data", {}).get("ticket") or data.get("ticket")
 
 
 # -------------------------
-# HANDLER
+# MESSAGE ROUTER (CLEAN)
 # -------------------------
 def handle_message(msg):
     t = msg.get("type")
     print("📥 MSG:", t, flush=True)
 
+    # ---------------- OBSERVATION ----------------
     if t == "observation":
         engine.process_observation(msg)
 
+    # ---------------- FORECAST ----------------
     elif t in ("forecast_versions", "forecast_updated"):
         engine.process_forecast(msg)
 
+    # ---------------- ORACLE SCORES ----------------
     elif t == "oracle_scores_updated":
         engine.process_oracle_scores(msg)
 
+    # ---------------- WEATHER EVENTS ----------------
     elif t == "weather_event":
         engine.process_weather_event(msg)
 
+    # ---------------- CONTROL ----------------
     elif t == "subscribed":
-        print("✅ SUBSCRIBED", msg.get("accepted"), flush=True)
+        print("✅ subscribed:", msg.get("accepted"), flush=True)
 
     elif t == "snapshot_complete":
-        print("📩 snapshot complete", flush=True)
+        print("📦 snapshot complete", flush=True)
 
+    # ---------------- UNKNOWN ----------------
     else:
         print("📩 UNKNOWN:", t, flush=True)
 
+    # update dashboard every message (cheap + safe)
     engine.tick()
 
 
 # -------------------------
-# WS
+# WEBSOCKET
 # -------------------------
 def on_message(ws, message):
     try:
@@ -99,9 +110,13 @@ def on_message(ws, message):
 
 def on_open(ws):
     print("🔌 connected", flush=True)
-    for c in CITIES:
-        ws.send(json.dumps({"type": "subscribe", "cities": [c]}))
-        print("📡 sub:", c, flush=True)
+
+    for city in CITIES:
+        ws.send(json.dumps({
+            "type": "subscribe",
+            "cities": [city]
+        }))
+        print(f"📡 subscribed: {city}", flush=True)
 
 
 def connect():
