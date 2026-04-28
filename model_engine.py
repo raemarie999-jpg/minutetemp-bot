@@ -27,6 +27,7 @@ class ModelEngine:
         if city and temp is not None:
             try:
                 temp = float(temp)
+
                 self.cities[city]["temps"].append(temp)
                 self.cities[city]["temps"] = self.cities[city]["temps"][-30:]
 
@@ -70,9 +71,15 @@ class ModelEngine:
                 if s.get("model") and s.get("score") is not None
             }
 
-        self.cities[city]["scores"]["overall"] = parse(msg.get("overall", {}).get("scores", []))
-        self.cities[city]["scores"]["day_ahead"] = parse(msg.get("day_ahead", {}).get("scores", []))
-        self.cities[city]["scores"]["day_of"] = parse(msg.get("day_of", {}).get("scores", []))
+        self.cities[city]["scores"]["overall"] = parse(
+            msg.get("overall", {}).get("scores", [])
+        )
+        self.cities[city]["scores"]["day_ahead"] = parse(
+            msg.get("day_ahead", {}).get("scores", [])
+        )
+        self.cities[city]["scores"]["day_of"] = parse(
+            msg.get("day_of", {}).get("scores", [])
+        )
 
     # -------------------------
     # WEATHER EVENTS
@@ -92,9 +99,12 @@ class ModelEngine:
         forecasts = self.cities[city]["forecasts"]
 
         for model, predicted in forecasts.items():
-            error = abs(predicted - actual_temp)
-            self.cities[city]["errors"][model].append(error)
-            self.cities[city]["errors"][model] = self.cities[city]["errors"][model][-20:]
+            try:
+                error = abs(float(predicted) - float(actual_temp))
+                self.cities[city]["errors"][model].append(error)
+                self.cities[city]["errors"][model] = self.cities[city]["errors"][model][-20:]
+            except:
+                continue
 
     # -------------------------
     # SCORING
@@ -200,7 +210,7 @@ class ModelEngine:
         return "\n".join(lines)
 
     # -------------------------
-    # LOOP
+    # LOOP / REPORTING
     # -------------------------
     def maybe_report(self):
         now = time.time()
@@ -209,18 +219,17 @@ class ModelEngine:
             temps = data["temps"]
             scores = data["scores"]
 
-            # ✅ Require minimum usable data
-            has_scores = any(len(s) > 0 for s in scores.values())
+            has_scores = any(len(v) > 0 for v in scores.values())
             has_temps = len(temps) >= 3
 
-        if not has_scores or not has_temps:
-            # print ONCE every ~60s so you know it's alive
-            if now - data["last_report"] > 60:
-                print(f"⚠️ {city}: warming up (need temps + scores)", flush=True)
-                data["last_report"] = now
-            continue
+            # warming up state
+            if not has_scores or not has_temps:
+                if now - data["last_report"] > 60:
+                    print(f"⚠️ {city}: warming up (need temps + scores)", flush=True)
+                    data["last_report"] = now
+                continue
 
-        # ✅ Print full report every 60s once ready
-        if now - data["last_report"] > 60:
-            print(self.generate_report(city), flush=True)
-            data["last_report"] = now
+            # report state
+            if now - data["last_report"] > 60:
+                print(self.generate_report(city), flush=True)
+                data["last_report"] = now
