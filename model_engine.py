@@ -199,19 +199,19 @@ class ModelEngine:
 
         return "\n".join(lines)
 
- # -------------------------
-# LOOP
-# -------------------------
-def maybe_report(self):
-    now = time.time()
+    # -------------------------
+    # LOOP
+    # -------------------------
+    def maybe_report(self):
+        now = time.time()
 
-    for city, data in self.cities.items():
-        temps = data["temps"]
-        scores = data["scores"]
+        for city, data in self.cities.items():
+            temps = data["temps"]
+            scores = data["scores"]
 
-        # ✅ Require minimum usable data
-        has_scores = any(len(s) > 0 for s in scores.values())
-        has_temps = len(temps) >= 3
+            # ✅ Require minimum usable data
+            has_scores = any(len(s) > 0 for s in scores.values())
+            has_temps = len(temps) >= 3
 
         if not has_scores or not has_temps:
             # print ONCE every ~60s so you know it's alive
