@@ -199,10 +199,10 @@ class ModelEngine:
 
         return "\n".join(lines)
 
-    # -------------------------
-    # LOOP
-    # -------------------------
-    def maybe_report(self):
+ # -------------------------
+# LOOP
+# -------------------------
+def maybe_report(self):
     now = time.time()
 
     for city, data in self.cities.items():
@@ -220,7 +220,7 @@ class ModelEngine:
                 data["last_report"] = now
             continue
 
-        # ✅ Always print every 60s once ready
+        # ✅ Print full report every 60s once ready
         if now - data["last_report"] > 60:
             print(self.generate_report(city), flush=True)
             data["last_report"] = now
