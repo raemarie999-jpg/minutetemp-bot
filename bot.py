@@ -4,7 +4,7 @@ import sys
 import requests
 import websocket
 
-from model_engine import ModelEngine
+from model_engine import ModelEngineV2 as ModelEngine
 
 # -------------------------
 # CONFIG
