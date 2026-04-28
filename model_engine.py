@@ -6,7 +6,7 @@ class ModelEngine:
     def __init__(self):
         self.cities = defaultdict(lambda: {
             "temps": [],
-            "forecasts": {},  # model -> temp prediction
+            "forecasts": {},  # model -> temp
             "scores": {
                 "overall": {},
                 "day_ahead": {},
@@ -15,17 +15,19 @@ class ModelEngine:
             "errors": defaultdict(list),
             "weather_events": [],
             "last_report": 0,
-            "initialized": time.time()
+            "last_activity": time.time()
         })
 
+        self.report_interval = 60  # seconds
+
     # -------------------------
-    # OBSERVATIONS (LIVE DATA)
+    # OBSERVATIONS
     # -------------------------
     def process_observation(self, msg):
         city = msg.get("slug")
         temp = msg.get("temperature_f")
 
-        if not city or temp is None:
+        if not city:
             return
 
         try:
@@ -33,9 +35,9 @@ class ModelEngine:
         except:
             return
 
-        c = self.cities[city]
-        c["temps"].append(temp)
-        c["temps"] = c["temps"][-50:]  # keep rolling window
+        self.cities[city]["temps"].append(temp)
+        self.cities[city]["temps"] = self.cities[city]["temps"][-50:]
+        self.cities[city]["last_activity"] = time.time()
 
         self.validate_forecasts(city, temp)
 
@@ -53,7 +55,7 @@ class ModelEngine:
             model = f.get("model")
             temp = f.get("temp_f")
 
-            if model is None or temp is None:
+            if not model:
                 continue
 
             try:
@@ -62,7 +64,7 @@ class ModelEngine:
                 continue
 
     # -------------------------
-    # ORACLE SCORES
+    # SCORES
     # -------------------------
     def process_scores(self, msg):
         city = msg.get("slug")
@@ -70,7 +72,7 @@ class ModelEngine:
             return
 
         def parse(block):
-            if not block:
+            if not isinstance(block, list):
                 return {}
             return {
                 s.get("model"): s.get("score")
@@ -82,6 +84,8 @@ class ModelEngine:
         self.cities[city]["scores"]["day_ahead"] = parse(msg.get("day_ahead", {}).get("scores", []))
         self.cities[city]["scores"]["day_of"] = parse(msg.get("day_of", {}).get("scores", []))
 
+        self.cities[city]["last_activity"] = time.time()
+
     # -------------------------
     # WEATHER EVENTS
     # -------------------------
@@ -92,12 +96,11 @@ class ModelEngine:
         if not city or not summary:
             return
 
-        c = self.cities[city]
-        c["weather_events"].append(summary)
-        c["weather_events"] = c["weather_events"][-30:]
+        self.cities[city]["weather_events"].append(summary)
+        self.cities[city]["weather_events"] = self.cities[city]["weather_events"][-30:]
 
     # -------------------------
-    # FORECAST VALIDATION
+    # VALIDATION
     # -------------------------
     def validate_forecasts(self, city, actual_temp):
         forecasts = self.cities[city]["forecasts"]
@@ -105,19 +108,18 @@ class ModelEngine:
         for model, predicted in forecasts.items():
             try:
                 error = abs(float(predicted) - actual_temp)
-                self.cities[city]["errors"][model].append(error)
-                self.cities[city]["errors"][model] = self.cities[city]["errors"][model][-50:]
             except:
                 continue
 
+            self.cities[city]["errors"][model].append(error)
+            self.cities[city]["errors"][model] = self.cities[city]["errors"][model][-30:]
+
     # -------------------------
-    # SCORING ENGINE
+    # SCORING
     # -------------------------
     def compute_score(self, city, model):
-        c = self.cities[city]
-
-        scores = c["scores"]
-        errors = c["errors"].get(model, [])
+        scores = self.cities[city]["scores"]
+        errors = self.cities[city]["errors"]
 
         overall = scores["overall"].get(model, 0) or 0
         day_ahead = scores["day_ahead"].get(model, 0) or 0
@@ -125,13 +127,12 @@ class ModelEngine:
 
         base = (day_of * 0.5) + (day_ahead * 0.3) + (overall * 0.2)
 
-        if errors:
-            avg_error = sum(errors) / len(errors)
-            penalty = avg_error * 0.03
-        else:
-            penalty = 0
+        err_list = errors.get(model, [])
+        if err_list:
+            avg_error = sum(err_list) / len(err_list)
+            base -= avg_error * 0.05
 
-        return base - penalty
+        return base
 
     # -------------------------
     # REGIME DETECTION
@@ -140,53 +141,52 @@ class ModelEngine:
         temps = self.cities[city]["temps"]
         events = self.cities[city]["weather_events"]
 
-        if len(temps) < 5:
-            return "INSUFFICIENT_DATA"
+        if len(temps) < 3:
+            return "INSUFFICIENT DATA"
 
         if len(events) > 8:
             return "STORMY"
 
-        delta = temps[-1] - temps[0]
+        change = abs(temps[-1] - temps[0])
 
-        if abs(delta) < 1:
+        if change < 1:
             return "STABLE"
-        elif abs(delta) < 3:
+        elif change < 4:
             return "TRANSITIONAL"
         else:
             return "VOLATILE"
 
     # -------------------------
-    # TRADE / DECISION SIGNAL
+    # SIGNAL
     # -------------------------
     def generate_signal(self, ranked):
         if not ranked:
-            return "NO_SIGNAL", "LOW"
+            return "NO DATA", "LOW"
 
         best_model, best_score = ranked[0]
 
-        spread = ranked[0][1] - ranked[-1][1] if len(ranked) > 1 else 0
+        if len(ranked) < 3:
+            return f"WEAK SIGNAL → {best_model}", "LOW"
 
-        if len(ranked) >= 5 and spread > 0.5:
-            return f"STRONG EDGE: {best_model}", "HIGH"
-        elif len(ranked) >= 3:
-            return f"WEAK EDGE: {best_model}", "MEDIUM"
-        else:
-            return "NO EDGE", "LOW"
+        if best_score > 0.7:
+            return f"STRONG SIGNAL → {best_model}", "HIGH"
+
+        return f"MODERATE SIGNAL → {best_model}", "MEDIUM"
 
     # -------------------------
-    # REPORT GENERATION
+    # REPORT
     # -------------------------
     def generate_report(self, city):
-        c = self.cities[city]
+        data = self.cities[city]
 
-        all_models = set()
-        for group in c["scores"].values():
-            all_models.update(group.keys())
+        models = set()
+        for block in data["scores"].values():
+            models.update(block.keys())
 
-        if not all_models:
-            return f"⚠️ {city.upper()}: waiting for model scores..."
+        if not models:
+            return f"⚠️ {city.upper()}: collecting model data..."
 
-        ranked = [(m, self.compute_score(city, m)) for m in all_models]
+        ranked = [(m, self.compute_score(city, m)) for m in models]
         ranked.sort(key=lambda x: x[1], reverse=True)
 
         regime = self.detect_regime(city)
@@ -194,15 +194,16 @@ class ModelEngine:
 
         lines = []
         lines.append("=" * 60)
-        lines.append(f"🏙 CITY INTELLIGENCE REPORT: {city.upper()}")
+        lines.append(f"🏙 CITY REPORT: {city.upper()}")
         lines.append("=" * 60)
+        lines.append(f"🌡 Temps: {len(data['temps'])}")
         lines.append(f"🌪 Regime: {regime}")
         lines.append(f"📊 Confidence: {confidence}")
         lines.append("")
-        lines.append("🏆 TOP MODELS")
+        lines.append("🏆 TOP MODELS:")
 
         for i, (m, s) in enumerate(ranked[:5], 1):
-            lines.append(f"{i}. {m:<15} → {s:.3f}")
+            lines.append(f"{i}. {m:<12} → {s:.3f}")
 
         lines.append("")
         lines.append(f"🎯 SIGNAL: {signal}")
@@ -211,27 +212,22 @@ class ModelEngine:
         return "\n".join(lines)
 
     # -------------------------
-    # REPORT LOOP (FIXED + RELIABLE)
+    # REPORT LOOP (FIXED)
     # -------------------------
     def maybe_report(self):
         now = time.time()
 
         for city, data in self.cities.items():
 
-            temps = data["temps"]
-            scores = data["scores"]
+            # always show activity state
+            has_any_data = len(data["temps"]) > 0 or len(data["scores"]["overall"]) > 0
 
-            has_temps = len(temps) >= 3
-            has_scores = any(len(v) > 0 for v in scores.values())
-
-            # warming phase
-            if not has_temps or not has_scores:
-                if now - data["last_report"] > 60:
-                    print(f"⚠️ {city.upper()}: warming up (collecting data...)", flush=True)
-                    data["last_report"] = now
+            if not has_any_data:
                 continue
 
-            # report phase
-            if now - data["last_report"] > 60:
-                print(self.generate_report(city), flush=True)
-                data["last_report"] = now
+            # cooldown logic
+            if now - data["last_report"] < self.report_interval:
+                continue
+
+            print(self.generate_report(city), flush=True)
+            data["last_report"] = now
