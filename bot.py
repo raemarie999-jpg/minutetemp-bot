@@ -1,15 +1,11 @@
 import json
 import os
 import sys
-import time
 import requests
 import websocket
 
 from model_engine import ModelEngineV2
 
-# -------------------------
-# CONFIG
-# -------------------------
 API_KEY = os.getenv("MINUTETEMP_API_KEY")
 
 TICKET_URL = os.getenv(
@@ -32,109 +28,86 @@ print("🔥 BOT STARTING", flush=True)
 print("🌍 CITIES:", CITIES, flush=True)
 
 if not API_KEY:
-    print("❌ MINUTETEMP_API_KEY not set", flush=True)
+    print("❌ missing API key", flush=True)
     sys.exit(1)
 
 engine = ModelEngineV2()
 
 
 # -------------------------
-# TICKET
+# SAFE TICKET
 # -------------------------
 def get_ticket():
-    print("📡 Requesting ticket...", flush=True)
-
     try:
-        res = requests.post(
+        r = requests.post(
             TICKET_URL,
             headers={"X-API-Key": API_KEY},
             timeout=10,
         )
+        if r.status_code != 200:
+            print("❌ ticket error:", r.text, flush=True)
+            return None
+
+        data = r.json()
+        return data.get("data", {}).get("ticket") or data.get("ticket")
+
     except Exception as e:
-        print("❌ Ticket error:", repr(e), flush=True)
+        print("❌ ticket exception:", repr(e), flush=True)
         return None
-
-    print("📨 Ticket status:", res.status_code, flush=True)
-
-    if res.status_code != 200:
-        print(res.text, flush=True)
-        return None
-
-    data = res.json()
-    return data.get("data", {}).get("ticket") or data.get("ticket")
 
 
 # -------------------------
-# MESSAGE HANDLER
+# HANDLER
 # -------------------------
 def handle_message(msg):
-    msg_type = msg.get("type")
-    print("📥 MSG:", msg_type, flush=True)
+    t = msg.get("type")
+    print("📥 MSG:", t, flush=True)
 
-    # ---------------- OBSERVATIONS ----------------
-    if msg_type == "observation":
+    if t == "observation":
         engine.process_observation(msg)
 
-    # ---------------- FORECASTS ----------------
-    elif msg_type in ["forecast_versions", "forecast_updated"]:
+    elif t in ("forecast_versions", "forecast_updated"):
         engine.process_forecast(msg)
 
-    # ---------------- ORACLE SCORES ----------------
-    elif msg_type == "oracle_scores_updated":
+    elif t == "oracle_scores_updated":
         engine.process_oracle_scores(msg)
 
-    # ---------------- WEATHER ----------------
-    elif msg_type == "weather_event":
+    elif t == "weather_event":
         engine.process_weather_event(msg)
 
-    # ---------------- SUBSCRIBE ----------------
-    elif msg_type == "subscribed":
+    elif t == "subscribed":
         print("✅ SUBSCRIBED", msg.get("accepted"), flush=True)
 
-    # ---------------- OTHER ----------------
+    elif t == "snapshot_complete":
+        print("📩 snapshot complete", flush=True)
+
     else:
-        print("📩 UNKNOWN:", msg_type, flush=True)
+        print("📩 UNKNOWN:", t, flush=True)
 
     engine.tick()
 
 
 # -------------------------
-# WS CALLBACKS
+# WS
 # -------------------------
 def on_message(ws, message):
     try:
-        data = json.loads(message)
-        handle_message(data)
+        handle_message(json.loads(message))
     except Exception as e:
-        print("❌ Parse error:", repr(e), flush=True)
+        print("❌ parse error:", repr(e), flush=True)
 
 
 def on_open(ws):
-    print("🔌 WebSocket connected", flush=True)
-
-    for city in CITIES:
-        ws.send(json.dumps({
-            "type": "subscribe",
-            "cities": [city]
-        }))
-        print(f"📡 Subscribed: {city}", flush=True)
+    print("🔌 connected", flush=True)
+    for c in CITIES:
+        ws.send(json.dumps({"type": "subscribe", "cities": [c]}))
+        print("📡 sub:", c, flush=True)
 
 
-def on_error(ws, error):
-    print("❌ WebSocket error:", error, flush=True)
-
-
-def on_close(ws, code, msg):
-    print("🔌 WebSocket closed", code, msg, flush=True)
-
-
-# -------------------------
-# CONNECT
-# -------------------------
 def connect():
     ticket = get_ticket()
     if not ticket:
-        print("❌ No ticket — exiting", flush=True)
+        print("❌ no ticket", flush=True)
         return
 
     ws = websocket.WebSocketApp(
@@ -142,13 +115,11 @@ def connect():
         subprotocols=["bearer", ticket],
         on_open=on_open,
         on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
     )
 
     ws.run_forever(ping_interval=30, ping_timeout=10)
 
 
 if __name__ == "__main__":
-    print("🚀 ENTERING MAIN LOOP", flush=True)
+    print("🚀 RUNNING", flush=True)
     connect()
