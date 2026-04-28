@@ -5,6 +5,8 @@ import websocket
 
 from model_engine import ModelEngineV3 as ModelEngine
 
+engine = ModelEngine ()
+
 API_KEY = os.getenv("MINUTETEMP_API_KEY")
 TICKET_URL = "https://api.minutetemp.com/api/v1/ws-ticket"
 WS_URL = "wss://api.minutetemp.com/ws/api/1m"
