@@ -72,10 +72,10 @@ class ModelEngine:
 
         data = self.cities[city]
 
-        def safe(obj):
+        def safe(block):
             out = {}
-            if isinstance(obj, list):
-                for x in obj:
+            if isinstance(block, list):
+                for x in block:
                     if isinstance(x, dict):
                         m = x.get("model")
                         s = x.get("score")
@@ -119,7 +119,7 @@ class ModelEngine:
                 continue
 
     # -------------------------
-    # SCORING (SAFE)
+    # SCORING
     # -------------------------
     def compute_score(self, city, model):
         data = self.cities[city]
@@ -156,36 +156,36 @@ class ModelEngine:
 
         if abs(delta) < 1:
             return "STABLE"
-        if abs(delta) < 3:
+        elif abs(delta) < 3:
             return "TRANSITION"
-        return "VOLATILE"
+        else:
+            return "VOLATILE"
 
     # -------------------------
-    # SIGNAL
+    # SIGNALS
     # -------------------------
     def generate_signal(self, ranked):
         if not ranked:
-            return "NO MODELS", "LOW"
+            return "NO DATA", "LOW"
 
         best, score = ranked[0]
 
         if score > 0.7:
             return f"STRONG LEADER: {best}", "HIGH"
-        if score > 0.4:
+        elif score > 0.4:
             return f"MODERATE LEADER: {best}", "MEDIUM"
-        return f"WEAK LEADER: {best}", "LOW"
+        else:
+            return f"WEAK LEADER: {best}", "LOW"
 
     # -------------------------
-    # REPORT (ALWAYS OUTPUTS)
+    # REPORT
     # -------------------------
     def generate_report(self, city):
         data = self.cities[city]
 
-        temps = data["temps"]
-
         models = set()
-        for group in data["scores"].values():
-            models.update(group.keys())
+        for block in data["scores"].values():
+            models.update(block.keys())
 
         ranked = []
         if models:
@@ -195,19 +195,16 @@ class ModelEngine:
         regime = self.detect_regime(city)
         signal, conf = self.generate_signal(ranked)
 
+        temps = data["temps"]
+
         lines = []
         lines.append("=" * 60)
         lines.append(f"🏙 CITY INTELLIGENCE: {city.upper()}")
         lines.append("-" * 60)
 
-        if temps:
-            lines.append(f"🌡 Temps: {len(temps)} | latest={temps[-1]:.1f}")
-        else:
-            lines.append("🌡 Temps: NO DATA")
-
+        lines.append(f"🌡 Temps: {len(temps)} latest={temps[-1]:.1f}" if temps else "🌡 Temps: NO DATA")
         lines.append(f"🌪 Regime: {regime}")
         lines.append(f"📊 Signal: {signal} ({conf})")
-
         lines.append("")
         lines.append("🏆 TOP MODELS:")
 
@@ -222,7 +219,7 @@ class ModelEngine:
         return "\n".join(lines)
 
     # -------------------------
-    # REPORT LOOP (FIXED)
+    # REPORT LOOP (THIS IS WHAT YOU WERE MISSING)
     # -------------------------
     def maybe_report(self):
         now = time.time()
