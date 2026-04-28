@@ -4,8 +4,11 @@ import sys
 import requests
 import websocket
 
-from model_engine import ModelEngineV3
+from model_engine import ModelEngineV4
 
+# -------------------------
+# CONFIG
+# -------------------------
 API_KEY = os.getenv("MINUTETEMP_API_KEY")
 
 TICKET_URL = os.getenv(
@@ -31,11 +34,10 @@ if not API_KEY:
     print("❌ Missing API key", flush=True)
     sys.exit(1)
 
-engine = ModelEngineV3()
-
+engine = ModelEngineV4()
 
 # -------------------------
-# TICKET
+# GET TICKET
 # -------------------------
 def get_ticket():
     try:
@@ -52,38 +54,47 @@ def get_ticket():
 
 
 # -------------------------
-# ROUTER
+# MESSAGE ROUTER (CLEAN)
 # -------------------------
 def handle_message(msg):
-    t = msg.get("type")
-    print("📥 MSG:", t, flush=True)
+    msg_type = msg.get("type")
 
-    if t == "observation":
+    # OBSERVATIONS → ENGINE ONLY
+    if msg_type == "observation":
         engine.process_observation(msg)
+        return
 
-    elif t in ("oracle_scores_updated",):
+    # ORACLE SCORES → CORE INTELLIGENCE
+    elif msg_type == "oracle_scores_updated":
         engine.process_oracle_scores(msg)
+        return
 
-    elif t in ("forecast_versions", "forecast_updated"):
+    # FORECAST DATA → OPTIONAL SIGNALS
+    elif msg_type in ("forecast_versions", "forecast_updated"):
         engine.process_forecast(msg)
+        return
 
-    elif t == "weather_event":
+    # WEATHER EVENTS → CONTEXT SIGNALS
+    elif msg_type == "weather_event":
         engine.process_weather_event(msg)
+        return
 
-    elif t == "subscribed":
-        print("✅ subscribed", msg.get("accepted"), flush=True)
+    # CONNECTION STATE
+    elif msg_type == "subscribed":
+        print("✅ STREAM CONNECTED", msg.get("accepted"), flush=True)
+        return
 
-    elif t == "snapshot_complete":
-        print("📦 snapshot complete", flush=True)
+    elif msg_type == "snapshot_complete":
+        print("📦 SNAPSHOT COMPLETE", flush=True)
+        return
 
+    # EVERYTHING ELSE = IGNORE CLEANLY
     else:
-        print("📩 UNKNOWN:", t, flush=True)
-
-    engine.tick()
+        return
 
 
 # -------------------------
-# WS
+# WEBSOCKET CALLBACKS
 # -------------------------
 def on_message(ws, message):
     try:
@@ -93,7 +104,7 @@ def on_message(ws, message):
 
 
 def on_open(ws):
-    print("🔌 connected", flush=True)
+    print("🔌 CONNECTED", flush=True)
 
     for city in CITIES:
         ws.send(json.dumps({
@@ -103,8 +114,20 @@ def on_open(ws):
         print(f"📡 subscribed: {city}", flush=True)
 
 
+def on_error(ws, error):
+    print("❌ ws error:", error, flush=True)
+
+
+def on_close(ws, code, msg):
+    print("🔌 disconnected", code, msg, flush=True)
+
+
+# -------------------------
+# CONNECT
+# -------------------------
 def connect():
     ticket = get_ticket()
+
     if not ticket:
         print("❌ no ticket", flush=True)
         return
@@ -114,11 +137,16 @@ def connect():
         subprotocols=["bearer", ticket],
         on_open=on_open,
         on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
     )
 
     ws.run_forever(ping_interval=30, ping_timeout=10)
 
 
+# -------------------------
+# MAIN
+# -------------------------
 if __name__ == "__main__":
-    print("🚀 RUNNING", flush=True)
+    print("🚀 RUNNING CLEAN ENGINE", flush=True)
     connect()
