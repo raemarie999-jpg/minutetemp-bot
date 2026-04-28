@@ -122,6 +122,15 @@ def handle_message(msg):
     if msg_type == "observation":
         live_stream_handler(msg)
 
+    elif msg_type == "station_report":
+        # 🔥 THIS IS THE MISSING PIECE
+        evaluation_handler({
+            "type": "forecast",
+            "city": msg.get("slug"),
+            "station_id": msg.get("station_id"),
+            "models": msg.get("models", []),
+        })
+
     elif msg_type in [
         "oracle_scores_updated",
         "forecast_updated",
