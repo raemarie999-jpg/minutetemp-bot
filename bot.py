@@ -5,15 +5,13 @@ import websocket
 
 from model_engine import ModelEngineV3 as ModelEngine
 
-engine = ModelEngine ()
-
 API_KEY = os.getenv("MINUTETEMP_API_KEY")
 TICKET_URL = "https://api.minutetemp.com/api/v1/ws-ticket"
 WS_URL = "wss://api.minutetemp.com/ws/api/1m"
 
 CITIES = [c.strip() for c in os.getenv("CITIES", "nyc,chi,dal").split(",")]
 
-engine = ModelEngineV3()
+engine = ModelEngine()
 
 
 def handle_message(msg):
@@ -37,10 +35,9 @@ def handle_message(msg):
         print("📦 snapshot complete", flush=True)
 
     elif msg_type == "subscribed":
-        print("✅ subscribed:", msg.get("accepted", {}), flush=True)
+        print("✅ subscribed", msg.get("accepted", {}), flush=True)
 
     elif msg_type == "price_update":
-        # intentionally ignored cleanly
         return
 
     else:
@@ -68,8 +65,8 @@ def on_open(ws):
 
 
 def get_ticket():
-    res = requests.post(TICKET_URL, headers={"X-API-Key": API_KEY})
-    return res.json()["data"]["ticket"]
+    r = requests.post(TICKET_URL, headers={"X-API-Key": API_KEY})
+    return r.json()["data"]["ticket"]
 
 
 def connect():
